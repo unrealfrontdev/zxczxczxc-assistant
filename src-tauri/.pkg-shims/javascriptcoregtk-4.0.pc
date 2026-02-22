@@ -1,0 +1,6 @@
+Name: JavaScriptCoreGTK
+Description: JavaScriptCoreGTK — compat shim 4.0→4.1 (Fedora 41+)
+Version: 2.50.4
+Requires: javascriptcoregtk-4.1
+Cflags: -I/usr/include/webkitgtk-4.1 -I/usr/include/glib-2.0 -I/usr/lib64/glib-2.0/include -I/usr/include/sysprof-6 -pthread
+Libs: -ljavascriptcoregtk-4.1 -lgobject-2.0 -lglib-2.0

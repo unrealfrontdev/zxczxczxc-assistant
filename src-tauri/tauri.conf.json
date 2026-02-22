@@ -1,0 +1,87 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "AI Assistant",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell":   { "open": true },
+      "dialog":  { "open": true },
+      "fs": {
+        "readFile": true,
+        "readDir":  true,
+        "scope": ["$HOME/**", "$DOCUMENT/**", "$DESKTOP/**"]
+      },
+      "globalShortcut": { "all": true },
+      "window": {
+        "all":               true,
+        "setAlwaysOnTop":    true,
+        "setIgnoreCursorEvents": true,
+        "setDecorations":    false
+      },
+      "http": {
+        "all":   true,
+        "scope": [
+          "https://api.openai.com/**",
+          "https://api.anthropic.com/**",
+          "https://api.deepseek.com/**",
+          "https://openrouter.ai/**",
+          "http://localhost/**",
+          "http://127.0.0.1/**"
+        ]
+      }
+    },
+    "bundle": {
+      "active":       true,
+      "category":     "DeveloperTool",
+      "icon":         ["icons/icon.png"],
+      "identifier":   "com.aiassistant.app",
+      "shortDescription": "AI overlay assistant",
+      "longDescription":  "Universal AI assistant overlay with screen capture",
+      "deb":          { "depends": [] },
+      "targets":      "all",
+      "macOS": {
+        "minimumSystemVersion": "12.0",
+        "entitlements": "entitlements.plist"
+      }
+    },
+    "security": {
+      "csp": "default-src 'self'; connect-src https://api.openai.com https://api.anthropic.com https://api.deepseek.com https://openrouter.ai http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'unsafe-inline'"
+    },
+    "systemTray": {
+      "iconPath":     "icons/icon.png",
+      "iconAsTemplate": true
+    },
+    "updater": { "active": false },
+    "windows": [
+      {
+        "label":        "main",
+        "title":        "AI Assistant",
+        "width":        480,
+        "height":       680,
+        "minWidth":     380,
+        "minHeight":    460,
+        "resizable":    true,
+        "fullscreen":   false,
+        "decorations":  false,
+        "transparent":  true,
+        "alwaysOnTop":  true,
+        "skipTaskbar":  false,
+        "center":       false,
+        "x":            40,
+        "y":            60,
+        "visible":      true,
+        "focus":        false
+      }
+    ]
+  }
+}

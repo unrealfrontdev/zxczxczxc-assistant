@@ -1,0 +1,56 @@
+[package]
+name    = "ai-assistant"
+version = "0.1.0"
+edition = "2021"
+description = "Universal AI Assistant Overlay"
+
+[build-dependencies]
+tauri-build = { version = "1", features = [] }
+
+[dependencies]
+tauri = { version = "1", features = [
+  "global-shortcut-all",
+  "window-all",
+  "dialog-open",
+  "fs-read-file",
+  "fs-read-dir",
+  "http-all",
+  "shell-open",
+  "system-tray",
+] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tokio       = { version = "1", features = ["full"] }
+reqwest     = { version = "0.11", features = ["json"] }
+base64      = "0.21"
+anyhow      = "1"
+log         = "0.4"
+env_logger  = "0.10"
+image       = "0.24"
+walkdir     = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { version = "1", features = ["full"] }
+
+# ── macOS ────────────────────────────────────────────────────────
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.23", features = ["highsierra"] }
+objc          = "0.2"
+cocoa         = "0.25"
+
+# ── Windows ──────────────────────────────────────────────────────
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.51", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+] }
+
+[features]
+default          = ["custom-protocol"]
+custom-protocol  = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "ai-assistant"
+path = "src/main.rs"
