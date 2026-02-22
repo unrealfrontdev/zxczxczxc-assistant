@@ -148,17 +148,243 @@ mod platform {
     }
 }
 
-// ── Linux stub (X11 / Wayland – placeholder) ────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// Linux — Wayland (grim) → X11 (scrot) → X11/Wayland (ImageMagick import)
+//
+// Priority order:
+//   Wayland priority:
+//     1. grim             — wlr-screencopy (sway, hyprland, river, …)
+//     2. gnome-screenshot — GNOME 41+ Wayland portal
+//     3. spectacle        — KDE Plasma
+//   X11 priority:
+//     4. scrot            — classic X11
+//     5. import           — ImageMagick X11 (last resort)
+//
+// Install on Fedora:  sudo dnf install grim gnome-screenshot spectacle scrot
+// Install on Ubuntu:  sudo apt install grim gnome-screenshot spectacle scrot
+// Install on Arch:    sudo pacman -S grim gnome-screenshot spectacle scrot
+// ═══════════════════════════════════════════════════════════════════════
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 mod platform {
     use super::CaptureResult;
-    use anyhow::{anyhow, Result};
+    use anyhow::{anyhow, Context, Result};
+    use base64::{engine::general_purpose, Engine};
+    use image::GenericImageView;
 
     pub fn capture_primary_screen() -> Result<CaptureResult> {
-        Err(anyhow!("Screen capture is not yet implemented on Linux"))
+        // Ensure WAYLAND_DISPLAY is set even if Tauri didn't inherit it
+        ensure_wayland_env();
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // ── Wayland backends ──────────────────────────────────────────
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            macro_rules! try_backend {
+                ($fn:expr, $name:expr) => {
+                    match $fn {
+                        Ok(r)  => return Ok(r),
+                        Err(e) => {
+                            log::warn!("{} failed: {}", $name, e);
+                            errors.push(format!("{}: {}", $name, e));
+                        }
+                    }
+                };
+            }
+            try_backend!(try_grim(),               "grim");
+            try_backend!(try_gnome_screenshot(),   "gnome-screenshot");
+            try_backend!(try_spectacle(),          "spectacle");
+        }
+
+        // ── X11 backends ──────────────────────────────────────────────
+        if std::env::var("DISPLAY").is_ok() {
+            match try_scrot() {
+                Ok(r)  => return Ok(r),
+                Err(e) => { log::warn!("scrot failed: {}", e); errors.push(format!("scrot: {}", e)); }
+            }
+            match try_import() {
+                Ok(r)  => return Ok(r),
+                Err(e) => { log::warn!("import failed: {}", e); errors.push(format!("import: {}", e)); }
+            }
+        }
+
+        Err(anyhow!(
+            "All screenshot backends failed:\n{}\n\nInstall grim (Wayland) or scrot (X11):\n  Fedora: sudo dnf install grim gnome-screenshot\n  Ubuntu: sudo apt install grim gnome-screenshot\n  Arch:   sudo pacman -S grim gnome-screenshot",
+            errors.join("\n")
+        ))
     }
+
+    /// Falls back to full-screen on Linux.
     pub fn capture_at_cursor() -> Result<CaptureResult> {
         capture_primary_screen()
+    }
+
+    // ── display detection ──────────────────────────────────────────────
+
+    /// If WAYLAND_DISPLAY is missing from the process env, try to detect
+    /// it from the well-known socket path (helps when Tauri is launched
+    /// from a systemd service or via .desktop without env inheritance).
+    fn ensure_wayland_env() {
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            return;
+        }
+        // Read UID from /proc/self/loginuid
+        let uid = std::fs::read_to_string("/proc/self/loginuid")
+            .unwrap_or_default();
+        let uid = uid.trim();
+        if uid.is_empty() || uid == "4294967295" { return; } // not a login session
+
+        let runtime_dir = format!("/run/user/{}", uid);
+        // Try wayland-0 … wayland-9
+        for i in 0..10 {
+            let socket = format!("{}/wayland-{}", runtime_dir, i);
+            if std::path::Path::new(&socket).exists() {
+                log::info!("Auto-detected WAYLAND_DISPLAY=wayland-{} for uid={}", i, uid);
+                // Safety: single-threaded at this point in Tauri init
+                unsafe {
+                    std::env::set_var("WAYLAND_DISPLAY", format!("wayland-{}", i));
+                    std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+                }
+                return;
+            }
+        }
+    }
+
+    // ── env helpers ────────────────────────────────────────────────────
+
+    fn apply_display_env(cmd: &mut std::process::Command) {
+        for var in &["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR",
+                     "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+    }
+
+    fn tmp_path() -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis()).unwrap_or(0);
+        format!("/tmp/ai-assistant-cap-{}.png", ts)
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────
+
+    fn png_bytes_to_result(bytes: Vec<u8>) -> Result<CaptureResult> {
+        let img = image::load_from_memory(&bytes)
+            .context("failed to decode screenshot PNG")?;
+        let (width, height) = img.dimensions();
+        let b64 = general_purpose::STANDARD.encode(&bytes);
+        Ok(CaptureResult { base64: b64, width, height, format: "png".into() })
+    }
+
+    fn read_tmp_png(path: &str) -> Result<CaptureResult> {
+        let bytes = std::fs::read(path).context("failed to read screenshot temp file")?;
+        let _ = std::fs::remove_file(path);
+        png_bytes_to_result(bytes)
+    }
+
+    fn which_ok(name: &str) -> bool {
+        std::process::Command::new("which")
+            .arg(name).output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    // ── backend: grim (Wayland, wlr-screencopy) ───────────────────────
+
+    fn try_grim() -> Result<CaptureResult> {
+        if !which_ok("grim") { return Err(anyhow!("grim not found in PATH")); }
+        let path = tmp_path();
+        let mut cmd = std::process::Command::new("grim");
+        cmd.arg(&path);
+        apply_display_env(&mut cmd);
+        let out = cmd.output().context("failed to spawn grim")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("grim exited {}: {}", out.status, stderr.trim()));
+        }
+        let r = read_tmp_png(&path)?;
+        log::info!("captured via grim");
+        Ok(r)
+    }
+
+    // ── backend: gnome-screenshot (GNOME Wayland portal) ──────────────
+
+    fn try_gnome_screenshot() -> Result<CaptureResult> {
+        if !which_ok("gnome-screenshot") { return Err(anyhow!("gnome-screenshot not found")); }
+        let path = tmp_path();
+        let mut cmd = std::process::Command::new("gnome-screenshot");
+        cmd.args(["--file", &path]);
+        apply_display_env(&mut cmd);
+        let out = cmd.output().context("failed to spawn gnome-screenshot")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("gnome-screenshot exited {}: {}", out.status, stderr.trim()));
+        }
+        let r = read_tmp_png(&path)?;
+        log::info!("captured via gnome-screenshot");
+        Ok(r)
+    }
+
+    // ── backend: spectacle (KDE) ──────────────────────────────────────
+
+    fn try_spectacle() -> Result<CaptureResult> {
+        if !which_ok("spectacle") { return Err(anyhow!("spectacle not found")); }
+        let path = tmp_path();
+        let mut cmd = std::process::Command::new("spectacle");
+        cmd.args(["-b", "-n", "-f", "-o", &path]);
+        apply_display_env(&mut cmd);
+        let out = cmd.output().context("failed to spawn spectacle")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("spectacle exited {}: {}", out.status, stderr.trim()));
+        }
+        if !std::path::Path::new(&path).exists() {
+            return Err(anyhow!("spectacle produced no output file"));
+        }
+        let r = read_tmp_png(&path)?;
+        log::info!("captured via spectacle");
+        Ok(r)
+    }
+
+    // ── backend: scrot (X11) ──────────────────────────────────────────
+
+    fn try_scrot() -> Result<CaptureResult> {
+        if !which_ok("scrot") { return Err(anyhow!("scrot not found in PATH")); }
+        let path = tmp_path();
+        let mut cmd = std::process::Command::new("scrot");
+        cmd.arg(&path);
+        apply_display_env(&mut cmd);
+        let status = cmd.status().context("failed to spawn scrot")?;
+        if !status.success() {
+            return Err(anyhow!("scrot exited with {}", status));
+        }
+        let r = read_tmp_png(&path)?;
+        log::info!("captured via scrot");
+        Ok(r)
+    }
+
+    // ── backend: ImageMagick import (X11 only) ────────────────────────
+
+    fn try_import() -> Result<CaptureResult> {
+        if !which_ok("import") { return Err(anyhow!("import not found in PATH")); }
+        if std::env::var("DISPLAY").is_err() {
+            return Err(anyhow!("import requires X11 DISPLAY (not set)"));
+        }
+        let mut cmd = std::process::Command::new("import");
+        cmd.args(["-window", "root", "-screen", "png:-"]);
+        apply_display_env(&mut cmd);
+        let out = cmd.output().context("failed to spawn import")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("import exited {}: {}", out.status, stderr.trim()));
+        }
+        if out.stdout.is_empty() {
+            return Err(anyhow!("import produced no output"));
+        }
+        let r = png_bytes_to_result(out.stdout)?;
+        log::info!("captured via ImageMagick import");
+        Ok(r)
     }
 }
 

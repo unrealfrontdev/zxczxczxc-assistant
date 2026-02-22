@@ -8,7 +8,7 @@ description = "Universal AI Assistant Overlay"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [
+tauri = { version = "1", features = [ "fs-create-dir", "fs-write-file",
   "global-shortcut-all",
   "window-all",
   "dialog-open",

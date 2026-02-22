@@ -17,8 +17,10 @@
       "shell":   { "open": true },
       "dialog":  { "open": true },
       "fs": {
-        "readFile": true,
-        "readDir":  true,
+        "readFile":  true,
+        "readDir":   true,
+        "writeFile": true,
+        "createDir": true,
         "scope": ["$HOME/**", "$DOCUMENT/**", "$DESKTOP/**"]
       },
       "globalShortcut": { "all": true },

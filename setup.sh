@@ -60,6 +60,9 @@ if [[ "$(uname)" == "Linux" ]]; then
       libsoup2.4-dev \
       xdotool \
       scrot \
+      grim \
+      gnome-screenshot \
+      spectacle \
       pkg-config \
       build-essential \
       curl \
@@ -90,6 +93,9 @@ if [[ "$(uname)" == "Linux" ]]; then
       file \
       xdotool \
       scrot \
+      grim \
+      gnome-screenshot \
+      spectacle \
       pkg-config \
       gcc \
       gcc-c++ \
@@ -149,6 +155,9 @@ if [[ "$(uname)" == "Linux" ]]; then
       libsoup-devel \
       xdotool \
       scrot \
+      grim \
+      gnome-screenshot \
+      spectacle \
       pkg-config \
       gcc \
       gcc-c++ \
@@ -166,6 +175,9 @@ if [[ "$(uname)" == "Linux" ]]; then
       librsvg \
       xdotool \
       scrot \
+      grim \
+      gnome-screenshot \
+      spectacle \
       pkg-config 2>/dev/null || true
 
   else
@@ -250,6 +262,15 @@ fi
 info "Installing Node dependencies…"
 npm install
 
+# ── 5a. Create dist/ placeholder ──────────────────────────────────────────
+# tauri::generate_context!() checks that distDir ("../dist") exists at
+# compile-time. Without this folder the Rust build panics before we even
+# run `npm run build`, so we create it eagerly.
+if [ ! -d "dist" ]; then
+  mkdir -p dist
+  info "Created dist/ placeholder (required by tauri::generate_context!)"
+fi
+
 # ── 5b. Fedora 41+ webkit2gtk-4.0 compat shims ────────────────────────────
 # Tauri v1 (wry 0.24) requires webkit2gtk-4.0 pkg-config files.
 # Fedora 41+ ships only webkit2gtk-4.1; we install compatibility shims.
@@ -326,6 +347,10 @@ echo ""
 echo "  ▶  Start dev server    npm run tauri dev"
 echo "  ▶  Run Rust tests      cd tests-standalone && cargo test"
 echo "  ▶  Build release       npm run tauri build"
+echo ""
+echo "  📸 Screen capture (Linux) uses first available tool:"
+echo "     Wayland → grim | gnome-screenshot | spectacle"
+echo "     X11     → scrot | import (ImageMagick)"
 echo ""
 if command -v dnf &>/dev/null; then
   # Show webkit hint only if neither variant is found via pkg-config

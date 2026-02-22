@@ -22,6 +22,56 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+/** A file-edit suggestion parsed from an AI response */
+export interface FileEdit {
+  /** Absolute or root-relative path as written by the AI */
+  filePath: string;
+  /** Full replacement content */
+  content: string;
+  /** Whether the edit has already been applied */
+  applied: boolean;
+}
+
+/**
+ * Parse all <<<FILE:path>>> … <<<END_FILE>>> blocks from an AI message.
+ * Returns an array of FileEdit objects (applied = false by default).
+ */
+export function parseFileEdits(text: string): FileEdit[] {
+  const edits: FileEdit[] = [];
+  const RE = /<<<FILE:([^\n>]+)>>>\n([\s\S]*?)<<<END_FILE>>>/g;
+  let m: RegExpExecArray | null;
+  while ((m = RE.exec(text)) !== null) {
+    edits.push({ filePath: m[1].trim(), content: m[2], applied: false });
+  }
+  return edits;
+}
+
+// System-prompt suffix injected when files are indexed
+const FILE_EDIT_INSTRUCTIONS = `
+
+---
+## File-editing capability
+You have **full read/write access** to the selected project directory.
+You can:
+- **Modify** any existing file, including empty ones.
+- **Create** new files that do not yet exist.
+- **Create** new subdirectories (just use a path like \`subdir/file.ts\` and the directory will be made automatically).
+
+When you want to create or change a file, output **exactly** this block (one block per file):
+
+<<<FILE:relative/or/absolute/path>>>
+<full new file content here — may be empty if intentionally blank>
+<<<END_FILE>>>
+
+Rules:
+- Output the **complete** new file content, not a diff.
+- For empty files, just leave the body blank between the markers.
+- Use paths relative to the project root (as shown in the context), or absolute paths.
+- You may output multiple FILE blocks in one response.
+- Explain your changes in plain text outside the FILE blocks.
+- NEVER say you cannot create or edit a file — you always can.
+`;
+
 interface AssistantState {
   // ── Overlay ──────────────────────────────────────────────────────────
   isClickThrough: boolean;
@@ -58,6 +108,12 @@ interface AssistantState {
   indexedRoot:    string;
   indexDirectory: (path: string) => Promise<void>;
   clearIndex:     () => void;
+
+  // ── File editing ─────────────────────────────────────────────────────
+  /** Apply a full-file replacement (or creation) at filePath */
+  applyEdit: (filePath: string, content: string, rootPath?: string) => Promise<void>;
+  /** Apply a patch (old → new string replacement) inside a file */
+  applyPatch: (filePath: string, oldText: string, newText: string) => Promise<void>;
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -94,6 +150,14 @@ export const useAssistantStore = create<AssistantState>()(
           set({ capturedImage: res.base64 });
         } catch (err) {
           console.error("Capture failed:", err);
+          // Show the error as an assistant message so the user can see it
+          const errMsg: ChatMessage = {
+            id:        crypto.randomUUID(),
+            role:      "assistant",
+            text:      `**Screenshot failed:** ${String(err)}\n\nMake sure \`grim\` (Wayland) or \`scrot\` / \`import\` (X11) is installed:\n\`\`\`bash\n# Fedora\nsudo dnf install grim ImageMagick\n# Ubuntu\nsudo apt install grim imagemagick\n# Arch\nsudo pacman -S grim imagemagick\n\`\`\``,
+            timestamp: Date.now(),
+          };
+          set((s) => ({ messages: [...s.messages, errMsg] }));
         } finally {
           set({ isCapturing: false });
         }
@@ -107,7 +171,7 @@ export const useAssistantStore = create<AssistantState>()(
       isLoading: false,
 
       sendMessage: async () => {
-        const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles } = get();
+        const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages } = get();
         if (provider !== "local" && !apiKey) return;
         if (!prompt.trim()) return;
 
@@ -127,6 +191,23 @@ export const useAssistantStore = create<AssistantState>()(
             .slice(0, 20)
             .map((f) => `### ${f.path}\n\`\`\`${f.extension}\n${f.content.slice(0, 3_000)}\n\`\`\``);
 
+          // Build conversation history from previous messages (last 10 turns = 20 messages)
+          const historyMessages = messages.slice(-20);
+          const historyBlock = historyMessages.length > 0
+            ? historyMessages
+                .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
+                .join("\n\n") + "\n\n"
+            : "";
+
+          // Build full prompt: history + current message + file-editing instructions
+          const currentText = indexedRoot
+            ? userMsg.text + FILE_EDIT_INSTRUCTIONS
+            : userMsg.text;
+
+          const fullPrompt = historyBlock
+            ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}`
+            : currentText;
+
           const command =
             provider === "openai"   ? "analyze_with_openai"   :
             provider === "claude"   ? "analyze_with_claude"   :
@@ -138,14 +219,14 @@ export const useAssistantStore = create<AssistantState>()(
             ? {
                 base_url:      localUrl,
                 api_key:       apiKey || null,
-                prompt:        userMsg.text,
+                prompt:        fullPrompt,
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
               }
             : {
                 api_key:       apiKey,
-                prompt:        userMsg.text,
+                prompt:        fullPrompt,
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
@@ -193,6 +274,43 @@ export const useAssistantStore = create<AssistantState>()(
         }
       },
       clearIndex: () => set({ indexedFiles: [], indexedRoot: "" }),
+
+      // ── File editing ───────────────────────────────────────────────
+      applyEdit: async (filePath, content, rootPath) => {
+        // Resolve relative paths against the indexed project root
+        const absPath =
+          filePath.startsWith("/")
+            ? filePath
+            : `${rootPath ?? get().indexedRoot}/${filePath}`;
+
+        await invoke("write_file", { filePath: absPath, content });
+
+        // Refresh that one file in the index if it was already indexed
+        set((s) => ({
+          indexedFiles: s.indexedFiles.map((f) =>
+            f.path === filePath
+              ? { ...f, content, size_bytes: new TextEncoder().encode(content).length, truncated: false }
+              : f
+          ),
+        }));
+      },
+
+      applyPatch: async (filePath, oldText, newText) => {
+        const absPath = filePath.startsWith("/")
+          ? filePath
+          : `${get().indexedRoot}/${filePath}`;
+
+        await invoke("patch_file", { filePath: absPath, oldText, newText });
+
+        // Update in-memory content
+        set((s) => ({
+          indexedFiles: s.indexedFiles.map((f) =>
+            f.path === filePath
+              ? { ...f, content: f.content.replace(oldText, newText) }
+              : f
+          ),
+        }));
+      },
     }),
     {
       name:    "ai-assistant-v1",

@@ -159,6 +159,64 @@ pub async fn read_file_content(file_path: String) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
+/// Write (overwrite or create) a file with the given content.
+/// Parent directories are created automatically.
+#[tauri::command]
+pub async fn write_file(file_path: String, content: String) -> Result<(), String> {
+    let path = Path::new(&file_path);
+
+    // Safety: refuse to write outside any reasonable filesystem path
+    if file_path.is_empty() {
+        return Err("file_path must not be empty".into());
+    }
+
+    // Create parent dirs if needed
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directories: {}", e))?;
+    }
+
+    std::fs::write(path, content.as_bytes())
+        .map_err(|e| format!("Failed to write '{}': {}", file_path, e))?;
+
+    log::info!("write_file: wrote {} bytes → {}", content.len(), file_path);
+    Ok(())
+}
+
+/// Apply a targeted string replacement inside a file.
+/// Fails if `old_text` is not found exactly once.
+#[tauri::command]
+pub async fn patch_file(
+    file_path: String,
+    old_text:  String,
+    new_text:  String,
+) -> Result<(), String> {
+    let path = Path::new(&file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read '{}': {}", file_path, e))?;
+
+    let count = original.matches(old_text.as_str()).count();
+    if count == 0 {
+        return Err(format!("old_text not found in '{}'", file_path));
+    }
+    if count > 1 {
+        return Err(format!(
+            "old_text matches {} times in '{}' — be more specific",
+            count, file_path
+        ));
+    }
+
+    let patched = original.replacen(old_text.as_str(), new_text.as_str(), 1);
+    std::fs::write(path, patched.as_bytes())
+        .map_err(|e| format!("Failed to write '{}': {}", file_path, e))?;
+
+    log::info!("patch_file: patched {}", file_path);
+    Ok(())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn is_ignored_dir(path: &Path) -> bool {

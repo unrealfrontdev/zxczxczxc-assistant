@@ -1,11 +1,9 @@
-import { useRef, useEffect } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { invoke } from "@tauri-apps/api/tauri";
+import { useRef, useEffect, useState } from "react";
 import { useAssistantStore } from "../store/assistantStore";
 import ApiKeyInput from "./ApiKeyInput";
 import ScreenshotPreview from "./ScreenshotPreview";
 import FileIndexer from "./FileIndexer";
+import FileEditBlock from "./FileEditBlock";
 
 export default function AssistantPanel() {
   const {
@@ -16,6 +14,17 @@ export default function AssistantPanel() {
   } = useAssistantStore();
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  const handleClearSession = () => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      setTimeout(() => setConfirmClear(false), 3000);
+      return;
+    }
+    clearMessages();
+    setConfirmClear(false);
+  };
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -49,12 +58,19 @@ export default function AssistantPanel() {
         {/* Right: controls */}
         <div className="flex items-center gap-1.5 pointer-events-auto">
           <button
-            onClick={clearMessages}
-            title="Clear conversation"
-            className="text-[10px] bg-white/10 hover:bg-white/20 px-2 py-1
-              rounded transition-colors"
+            onClick={handleClearSession}
+            title={confirmClear ? "Click again to confirm — this clears AI memory!" : "New session (clears AI memory)"}
+            className={[
+              "text-[10px] px-2 py-1 rounded transition-all font-mono",
+              confirmClear
+                ? "bg-red-500/80 text-white animate-pulse"
+                : messages.length > 0
+                ? "bg-white/10 hover:bg-red-500/40 hover:text-red-200"
+                : "bg-white/5 text-white/30 cursor-default",
+            ].join(" ")}
+            disabled={messages.length === 0 && !confirmClear}
           >
-            🗑
+            {confirmClear ? "⚠ Sure?" : "🔄 New"}
           </button>
           <button
             onClick={toggleClickThrough}
@@ -84,7 +100,8 @@ export default function AssistantPanel() {
             text-white/20 text-sm text-center gap-2 select-none">
             <span className="text-4xl">🤖</span>
             <p>Take a screenshot or ask anything.</p>
-            <p className="text-[11px]">Ctrl+Enter to send · Alt+Space passthrough · Alt+Shift+S capture</p>
+            <p className="text-[11px]">Ctrl+Enter to send · Alt+M passthrough · Alt+Shift+S capture</p>
+            <p className="text-[10px] mt-1">🔄 New — clears AI memory &amp; starts fresh session</p>
           </div>
         )}
 
@@ -106,9 +123,7 @@ export default function AssistantPanel() {
               />
             )}
             {msg.role === "assistant" ? (
-              <div className="prose prose-invert prose-sm max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
-              </div>
+              <FileEditBlock text={msg.text} />
             ) : (
               <p className="whitespace-pre-wrap break-words">{msg.text}</p>
             )}

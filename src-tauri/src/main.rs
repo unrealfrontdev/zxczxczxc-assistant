@@ -89,6 +89,8 @@ fn main() {
             ai_bridge::analyze_with_claude,
             project_indexer::index_directory,
             project_indexer::read_file_content,
+            project_indexer::write_file,
+            project_indexer::patch_file,
             ai_bridge::analyze_with_deepseek,
             ai_bridge::analyze_with_openrouter,
             ai_bridge::analyze_with_local,
