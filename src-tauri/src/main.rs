@@ -7,6 +7,7 @@ mod ai_bridge;
 mod overlay;
 mod project_indexer;
 mod screen_capture;
+mod web_search;
 
 use tauri::{GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 
@@ -94,6 +95,9 @@ fn main() {
             ai_bridge::analyze_with_deepseek,
             ai_bridge::analyze_with_openrouter,
             ai_bridge::analyze_with_local,
+            web_search::web_search,
+            web_search::fetch_url_content,
+            web_search::search_and_fetch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

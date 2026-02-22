@@ -38,7 +38,12 @@
           "https://api.deepseek.com/**",
           "https://openrouter.ai/**",
           "http://localhost/**",
-          "http://127.0.0.1/**"
+          "http://127.0.0.1/**",
+          "https://api.search.brave.com/**",
+          "https://api.duckduckgo.com/**",
+          "https://html.duckduckgo.com/**",
+          "https://*/*",
+          "http://*/*"
         ]
       }
     },
@@ -57,7 +62,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; connect-src https://api.openai.com https://api.anthropic.com https://api.deepseek.com https://openrouter.ai http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src https: http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'unsafe-inline'"
     },
     "systemTray": {
       "iconPath":     "icons/icon.png",

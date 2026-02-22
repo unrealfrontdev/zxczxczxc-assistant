@@ -4,6 +4,7 @@ import ApiKeyInput from "./ApiKeyInput";
 import ScreenshotPreview from "./ScreenshotPreview";
 import FileIndexer from "./FileIndexer";
 import FileEditBlock from "./FileEditBlock";
+import WebSearchToggle from "./WebSearchToggle";
 
 export default function AssistantPanel() {
   const {
@@ -91,6 +92,7 @@ export default function AssistantPanel() {
       <div className="shrink-0 px-3 pt-3 space-y-2">
         <ApiKeyInput />
         <FileIndexer />
+        <WebSearchToggle />
       </div>
 
       {/* ── Message thread ────────────────────────────────────────── */}

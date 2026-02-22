@@ -29,6 +29,7 @@ dependencies = [
  "image",
  "log",
  "objc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

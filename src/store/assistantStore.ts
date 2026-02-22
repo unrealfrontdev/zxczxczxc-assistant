@@ -114,6 +114,21 @@ interface AssistantState {
   applyEdit: (filePath: string, content: string, rootPath?: string) => Promise<void>;
   /** Apply a patch (old → new string replacement) inside a file */
   applyPatch: (filePath: string, oldText: string, newText: string) => Promise<void>;
+  // ── Web Search ───────────────────────────────────────────────────────────
+  webSearchEnabled: boolean;
+  setWebSearchEnabled: (v: boolean) => void;
+  searchBackend: "brave" | "searxng" | "duckduckgo";
+  setSearchBackend: (b: "brave" | "searxng" | "duckduckgo") => void;
+  searchApiKey: string;
+  setSearchApiKey: (k: string) => void;
+  searxngUrl: string;
+  setSearxngUrl: (url: string) => void;
+  /** Fetch full page content for top search results (slower but much better context) */
+  fetchPageContent: boolean;
+  setFetchPageContent: (v: boolean) => void;
+  /** Max search results to retrieve */
+  searchMaxResults: number;
+  setSearchMaxResults: (n: number) => void;
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -137,7 +152,7 @@ export const useAssistantStore = create<AssistantState>()(
       setProvider: (p) => set({ provider: p }),
       model: "gpt-4o",
       setModel: (m) => set({ model: m }),
-      localUrl: "http://localhost:1234/api/v1/chat",
+      localUrl: "http://127.0.0.1:1234/api/v1/chat",
       setLocalUrl: (url) => set({ localUrl: url }),
 
       // ── Capture ────────────────────────────────────────────────────
@@ -171,7 +186,8 @@ export const useAssistantStore = create<AssistantState>()(
       isLoading: false,
 
       sendMessage: async () => {
-        const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages } = get();
+        const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages,
+                webSearchEnabled, searchBackend, searchApiKey, searxngUrl } = get();
         if (provider !== "local" && !apiKey) return;
         if (!prompt.trim()) return;
 
@@ -204,9 +220,45 @@ export const useAssistantStore = create<AssistantState>()(
             ? userMsg.text + FILE_EDIT_INSTRUCTIONS
             : userMsg.text;
 
+          // ── Web search (if enabled) ──────────────────────────────
+          let webSearchContext = "";
+          if (webSearchEnabled && prompt.trim()) {
+            try {
+              const { fetchPageContent, searchMaxResults } = get();
+              const command = fetchPageContent ? "search_and_fetch" : "web_search";
+              const searchReq = {
+                query:         userMsg.text.slice(0, 300).trim(),
+                backend:       searchBackend,
+                api_key:       searchBackend === "brave" ? searchApiKey : null,
+                base_url:      searchBackend === "searxng" ? searxngUrl : null,
+                max_results:   searchMaxResults,
+                fetch_content: fetchPageContent,
+              };
+              const searchRes = await invoke<{
+                results: Array<{ title: string; url: string; snippet: string; content?: string }>;
+                backend: string;
+              }>(command, { req: searchReq });
+
+              if (searchRes.results.length > 0) {
+                webSearchContext = `\n\n---\n🌐 **WEB SEARCH RESULTS** (via ${searchRes.backend}, ${searchRes.results.length} results)\n`;
+                searchRes.results.forEach((r, i) => {
+                  webSearchContext += `\n### ${i + 1}. ${r.title}\n🔗 ${r.url}\n${r.snippet}`;
+                  if (r.content) {
+                    webSearchContext += `\n\n**Page content:**\n${r.content}`;
+                  }
+                  webSearchContext += "\n";
+                });
+                webSearchContext += "\n---\nAnswer using the search results above. Cite source URLs when relevant. Prefer information from fetched page content over snippets.\n";
+              }
+            } catch (err) {
+              console.warn("Web search failed:", err);
+              webSearchContext = `\n\n⚠️ Web search failed: ${String(err)}\n`;
+            }
+          }
+
           const fullPrompt = historyBlock
-            ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}`
-            : currentText;
+            ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}${webSearchContext}`
+            : `${currentText}${webSearchContext}`;
 
           const command =
             provider === "openai"   ? "analyze_with_openai"   :
@@ -275,6 +327,18 @@ export const useAssistantStore = create<AssistantState>()(
       },
       clearIndex: () => set({ indexedFiles: [], indexedRoot: "" }),
 
+      // ── Web Search ────────────────────────────────────────────────
+      webSearchEnabled: false,
+      setWebSearchEnabled: (v) => set({ webSearchEnabled: v }),
+      searchBackend: "duckduckgo",
+      setSearchBackend: (b) => set({ searchBackend: b }),
+      searchApiKey: "",
+      setSearchApiKey: (k) => set({ searchApiKey: k }),
+      searxngUrl: "http://localhost:8080",
+      setSearxngUrl: (url) => set({ searxngUrl: url }),      fetchPageContent: false,
+      setFetchPageContent: (v) => set({ fetchPageContent: v }),
+      searchMaxResults: 5,
+      setSearchMaxResults: (n) => set({ searchMaxResults: n }),
       // ── File editing ───────────────────────────────────────────────
       applyEdit: async (filePath, content, rootPath) => {
         // Resolve relative paths against the indexed project root
@@ -317,10 +381,16 @@ export const useAssistantStore = create<AssistantState>()(
       storage: createJSONStorage(() => localStorage),
       // Only persist configuration — not volatile UI state
       partialize: (s) => ({
-        apiKey:   s.apiKey,
-        provider: s.provider,
-        model:    s.model,
-        localUrl: s.localUrl,
+        apiKey:           s.apiKey,
+        provider:         s.provider,
+        model:            s.model,
+        localUrl:         s.localUrl,
+        webSearchEnabled: s.webSearchEnabled,
+        searchBackend:    s.searchBackend,
+        searchApiKey:     s.searchApiKey,
+        searxngUrl:       s.searxngUrl,
+        fetchPageContent: s.fetchPageContent,
+        searchMaxResults: s.searchMaxResults,
       }),
     }
   )

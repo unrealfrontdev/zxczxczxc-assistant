@@ -143,7 +143,8 @@ fn build_prompt(req: &AiRequest) -> String {
 
 fn http_client() -> reqwest::Result<Client> {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(600)) // 10 min — local LLMs can be slow
         .build()
 }
 
@@ -476,7 +477,8 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
     let body = json!({
         "model":      model,
         "messages":   [{ "role": "user", "content": content }],
-        "max_tokens": 2048
+        "max_tokens": 4096,
+        "stream":     false
     });
 
     let mut builder = client.post(&url).json(&body);
@@ -489,14 +491,19 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
     let resp = builder
         .send()
         .await
-        .map_err(|e| format!(
-            "Cannot reach local LLM at {}\n\
-             • Is the server running?\n\
-             • Check the URL includes the endpoint path\n\
-             (LM Studio → http://host:port/api/v1/chat  |  Ollama → http://host:port)\n\
-             Detail: {}",
-            url, e
-        ))?;
+        .map_err(|e| {
+            let reason = if e.is_timeout() {
+                "соединение превысило таймаут (сервер не ответил вовремя)".to_string()
+            } else if e.is_connect() {
+                "не удалось подключиться (сервер не запущен или порт закрыт)".to_string()
+            } else {
+                e.to_string()
+            };
+            format!(
+                "Локальная модель недоступна: {}\n\nURL: {}\n\nПодсказки:\n• Запущен ли сервер и загружена ли модель?\n• LM Studio: вкладка 'Local Server' → зелёная кнопка + модель выбрана\n• LM Studio → http://127.0.0.1:PORT  (не localhost!)\n• Ollama → http://127.0.0.1:11434",
+                reason, url
+            )
+        })?;
 
     let status = resp.status();
     let json: Value = resp.json().await.map_err(|e| e.to_string())?;

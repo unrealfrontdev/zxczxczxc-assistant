@@ -28,6 +28,7 @@ log         = "0.4"
 env_logger  = "0.10"
 image       = "0.24"
 walkdir     = "2"
+regex       = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
