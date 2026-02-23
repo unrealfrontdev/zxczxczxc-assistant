@@ -301,6 +301,29 @@ pub fn spawn_cursor_tracker(window: Window) {
     });
 }
 
+// ── Platform-specific cursor-X implementations ────────────────────────────
+
+/// Windows: query cursor position via Win32 GetCursorPos.
+/// No external tools required — works out of the box on any Win10/11 machine.
+#[cfg(target_os = "windows")]
+fn get_cursor_x() -> Option<i32> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut pt).is_ok() {
+            Some(pt.x)
+        } else {
+            None
+        }
+    }
+}
+
+/// Linux / macOS: try xdotool (X11) and hyprctl (Hyprland Wayland).
+/// On macOS this is currently unused because the cursor tracker is not
+/// needed — the panel takes the right portion of the overlay and macOS
+/// handles hit-testing transparently. Return None to keep the tracker idle.
+#[cfg(not(target_os = "windows"))]
 fn get_cursor_x() -> Option<i32> {
     // X11 — xdotool
     if let Ok(out) = std::process::Command::new("xdotool")
