@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { useAssistantStore } from "../store/assistantStore";
+import { useAssistantStore, LANGUAGE_NAMES } from "../store/assistantStore";
 import ApiKeyInput from "./ApiKeyInput";
 import ScreenshotPreview from "./ScreenshotPreview";
 import FileIndexer from "./FileIndexer";
@@ -20,6 +20,8 @@ export default function AssistantPanel() {
     isGhostMode, toggleGhostMode,
     archivedChats, archiveCurrentChat, activeSessionId,
     windowMode, setWindowMode,
+    responseLanguage, setResponseLanguage,
+    characters, activeCharacterId,
   } = useAssistantStore();
 
   const scrollRef      = useRef<HTMLDivElement>(null);
@@ -27,6 +29,16 @@ export default function AssistantPanel() {
   const [cfgOpen,       setCfgOpen]       = useState(false);
   const [promptsOpen,   setPromptsOpen]   = useState(false);
   const [historyOpen,   setHistoryOpen]   = useState(false);
+  const [charsOpen,     setCharsOpen]     = useState(false);
+  const [langOpen,      setLangOpen]      = useState(false);
+
+  const togglePanel = (name: "cfg" | "history" | "prompts" | "chars") => {
+    setCfgOpen(name === "cfg" ? (o) => !o : false);
+    setHistoryOpen(name === "history" ? (o) => !o : false);
+    setPromptsOpen(name === "prompts" ? (o) => !o : false);
+    setCharsOpen(name === "chars" ? (o) => !o : false);
+    setLangOpen(false);
+  };
 
   // ── Report panel left-X to Rust so cursor tracker can use it ──────────
   useEffect(() => {
@@ -146,7 +158,7 @@ export default function AssistantPanel() {
           <div className="flex items-center gap-1 pointer-events-auto">
             {/* Config toggle */}
             <button
-              onClick={() => { setCfgOpen((o) => !o); setHistoryOpen(false); setPromptsOpen(false); }}
+              onClick={() => togglePanel("cfg")}
               title="Settings"
               className={[
                 "text-[10px] px-2 py-1 rounded transition-colors font-mono",
@@ -158,7 +170,7 @@ export default function AssistantPanel() {
 
             {/* Chat history */}
             <button
-              onClick={() => { setHistoryOpen((o) => !o); setCfgOpen(false); setPromptsOpen(false); }}
+              onClick={() => togglePanel("history")}
               title="Chat history"
               className={[
                 "text-[10px] px-2 py-1 rounded transition-colors font-mono relative",
@@ -174,7 +186,7 @@ export default function AssistantPanel() {
 
             {/* Prompts quick-access */}
             <button
-              onClick={() => { setPromptsOpen((o) => !o); setCfgOpen(false); setHistoryOpen(false); }}
+              onClick={() => togglePanel("prompts")}
               title="Prompt library"
               className={[
                 "text-[10px] px-2 py-1 rounded transition-colors font-mono",
@@ -183,6 +195,73 @@ export default function AssistantPanel() {
             >
               📚
             </button>
+
+            {/* Characters */}
+            <button
+              onClick={() => togglePanel("chars")}
+              title="Characters"
+              className={[
+                "text-[10px] px-2 py-1 rounded transition-colors font-mono relative",
+                charsOpen ? "bg-pink-500/30 text-pink-200" : "bg-white/5 text-white/40 hover:bg-white/10 hover:text-pink-300",
+              ].join(" ")}
+            >
+              🎭
+              {activeCharacterId && (
+                <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full
+                  bg-pink-400 pointer-events-none" />
+              )}
+            </button>
+
+            {/* Language switcher */}
+            <div className="relative">
+              <button
+                onClick={() => { setLangOpen((o) => !o); }}
+                title={"Response language: " + (responseLanguage === "auto" ? "Auto" : (LANGUAGE_NAMES[responseLanguage] ?? responseLanguage))}
+                className={[
+                  "text-[10px] px-2 py-1 rounded transition-colors font-mono",
+                  langOpen || responseLanguage !== "auto"
+                    ? "bg-sky-500/30 text-sky-200"
+                    : "bg-white/5 text-white/40 hover:bg-white/10 hover:text-sky-300",
+                ].join(" ")}
+              >
+                🌐{responseLanguage !== "auto" ? <span className="ml-0.5 text-[9px] uppercase">{responseLanguage}</span> : null}
+              </button>
+              {langOpen && (
+                <div
+                  className="absolute right-0 top-full mt-1 z-50 w-52
+                    bg-gray-900 border border-white/10 rounded-xl shadow-2xl
+                    py-1 overflow-hidden"
+                >
+                  {/* Auto option */}
+                  <button
+                    onClick={() => { setResponseLanguage("auto"); setLangOpen(false); }}
+                    className={[
+                      "w-full text-left px-3 py-1.5 text-[11px] transition-colors",
+                      responseLanguage === "auto"
+                        ? "bg-sky-500/20 text-sky-300"
+                        : "text-white/60 hover:bg-white/5 hover:text-white",
+                    ].join(" ")}
+                  >
+                    🔁 Auto (match user)
+                  </button>
+                  <div className="my-1 border-t border-white/[0.06]" />
+                  {Object.entries(LANGUAGE_NAMES).map(([code, label]) => (
+                    <button
+                      key={code}
+                      onClick={() => { setResponseLanguage(code); setLangOpen(false); }}
+                      className={[
+                        "w-full text-left px-3 py-1.5 text-[11px] transition-colors",
+                        responseLanguage === code
+                          ? "bg-sky-500/20 text-sky-300"
+                          : "text-white/60 hover:bg-white/5 hover:text-white",
+                      ].join(" ")}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {/* Clear / archive session */}
             <button
@@ -236,6 +315,12 @@ export default function AssistantPanel() {
             <ApiKeyInput />
             <FileIndexer />
             <WebSearchToggle />
+          </div>
+        )}
+
+        {/* ── Characters panel ─────────────────────────────────────────── */}
+        {charsOpen && (
+          <div className="shrink-0 px-3 pt-3 pb-2 border-b border-white/[0.07]">
             <CharacterImport />
           </div>
         )}

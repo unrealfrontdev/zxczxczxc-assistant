@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/tauri";
 import { useAssistantStore } from "../store/assistantStore";
 
 /**
@@ -7,7 +8,16 @@ import { useAssistantStore } from "../store/assistantStore";
  * Call once at the top-level App component.
  */
 export function useTauriEvents() {
-  const { setClickThrough, setGhostMode, triggerCapture } = useAssistantStore();
+  const { setClickThrough, setGhostMode, triggerCapture, windowMode } = useAssistantStore();
+
+  // ── Restore last-used window mode on startup ────────────────────────────
+  useEffect(() => {
+    invoke("set_window_mode", {
+      windowed: windowMode === "windowed",
+      onTop: windowMode === "windowed" ? false : true,
+    }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally run once on mount with the persisted value
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
