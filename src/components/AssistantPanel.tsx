@@ -9,6 +9,7 @@ import WebSearchToggle from "./WebSearchToggle";
 import PromptLibrary from "./PromptLibrary";
 import CharacterImport from "./CharacterImport";
 import ChatHistory from "./ChatHistory";
+import StFormatText, { ST_FORMAT_EXAMPLES } from "./StFormatText";
 
 const PANEL_WIDTH = 420;
 
@@ -21,7 +22,7 @@ export default function AssistantPanel() {
     archivedChats, archiveCurrentChat, activeSessionId,
     windowMode, setWindowMode,
     responseLanguage, setResponseLanguage,
-    characters, activeCharacterId,
+    activeCharacterId,
   } = useAssistantStore();
 
   const scrollRef      = useRef<HTMLDivElement>(null);
@@ -378,7 +379,9 @@ export default function AssistantPanel() {
               {msg.role === "assistant" ? (
                 <FileEditBlock text={msg.text} />
               ) : (
-                <p className="whitespace-pre-wrap break-words text-white/85">{msg.text}</p>
+                <p className="whitespace-pre-wrap break-words text-white/85">
+                  <StFormatText text={msg.text} />
+                </p>
               )}
               <p className="text-[9px] text-white/20 mt-1 text-right">
                 {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
@@ -410,7 +413,57 @@ export default function AssistantPanel() {
             </div>
           )}
 
+          {/* ── ST format quick-insert (visible when a character is active) ── */}
+          {activeCharacterId && (
+            <div className="flex gap-1 flex-wrap">
+              <span className="text-[9px] text-white/20 self-center mr-0.5">insert:</span>
+              {ST_FORMAT_EXAMPLES.map((ex) => (
+                <button
+                  key={ex.label}
+                  title={ex.description}
+                  onClick={() => {
+                    const ins = ex.syntax;
+                    const ta  = document.querySelector<HTMLTextAreaElement>("textarea[data-st]");
+                    if (ta) {
+                      const s = ta.selectionStart;
+                      const e = ta.selectionEnd;
+                      const before = prompt.slice(0, s);
+                      const after  = prompt.slice(e);
+                      const selected = prompt.slice(s, e);
+                      // If text is selected, wrap it; else insert template
+                      let insert: string;
+                      if (ex.label === '"Dialogue"') {
+                        insert = selected ? `"${selected}"` : '"your dialogue here"';
+                      } else if (ex.label === '*Action*') {
+                        insert = selected ? `*${selected}*` : '*does something*';
+                      } else {
+                        insert = selected ? `((${selected}))` : '((your note))';
+                      }
+                      const next = before + insert + after;
+                      setPrompt(next);
+                      // Restore selection after React re-render
+                      setTimeout(() => {
+                        ta.focus();
+                        ta.setSelectionRange(s + insert.length, s + insert.length);
+                      }, 0);
+                    } else {
+                      setPrompt((p) => p + ins);
+                    }
+                  }}
+                  className={[
+                    "text-[9px] px-1.5 py-0.5 rounded font-mono transition-colors",
+                    "bg-white/5 hover:bg-white/10",
+                    ex.color,
+                  ].join(" ")}
+                >
+                  {ex.label}
+                </button>
+              ))}
+            </div>
+          )}
+
           <textarea
+            data-st
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={handleKeyDown}

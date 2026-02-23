@@ -21,6 +21,7 @@ import {
   extractCharaFromPng,
   parseCharacterCardJson,
 } from "../store/assistantStore";
+import StFormatText, { ST_FORMAT_EXAMPLES } from "./StFormatText";
 
 export default function CharacterImport() {
   const {
@@ -177,6 +178,14 @@ interface CharCardProps {
 }
 
 function CharCard({ char, isActive, isExpanded, onToggleExpand, onActivate, onDelete }: CharCardProps) {
+  const [showTips, setShowTips] = useState(false);
+
+  const handleActivate = () => {
+    const willActivate = !isActive;
+    onActivate();
+    if (willActivate) setShowTips(true);
+    else setShowTips(false);
+  };
   return (
     <div
       className={[
@@ -220,7 +229,7 @@ function CharCard({ char, isActive, isExpanded, onToggleExpand, onActivate, onDe
             {isExpanded ? "▲" : "▼"}
           </button>
           <button
-            onClick={onActivate}
+            onClick={handleActivate}
             title={isActive ? "Deactivate" : "Activate as system prompt"}
             className={[
               "text-[9px] px-1.5 py-0.5 rounded transition-colors",
@@ -257,6 +266,43 @@ function CharCard({ char, isActive, isExpanded, onToggleExpand, onActivate, onDe
           {char.first_mes && (
             <Field label="First message" value={char.first_mes} />
           )}
+        </div>
+      )}
+
+      {/* ── Formatting tips (shown after activation) ─────────────── */}
+      {isActive && showTips && (
+        <div className="border-t border-pink-500/20 bg-pink-950/30 px-3 py-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-[9px] font-semibold text-pink-300/80 uppercase tracking-wider">
+              💬 Roleplay formatting
+            </p>
+            <button
+              onClick={() => setShowTips(false)}
+              className="text-[9px] text-white/25 hover:text-white/60"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="text-[9px] text-white/40 leading-relaxed">
+            You can separate dialogue, actions and OOC notes using these styles:
+          </p>
+          <div className="space-y-1.5">
+            {ST_FORMAT_EXAMPLES.map((ex) => (
+              <div key={ex.label} className="flex items-start gap-2">
+                <code className={`text-[9px] font-mono shrink-0 ${ex.color}`}>{ex.label}</code>
+                <div className="space-y-0.5">
+                  <p className="text-[9px] text-white/30">{ex.description}</p>
+                  <div className="text-[9px] text-white/50 font-mono">
+                    <span className="text-white/20">e.g. </span>
+                    <StFormatText text={ex.syntax} />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="text-[9px] text-white/25 italic">
+            Use the insert buttons below the chat input for quick formatting.
+          </p>
         </div>
       )}
     </div>

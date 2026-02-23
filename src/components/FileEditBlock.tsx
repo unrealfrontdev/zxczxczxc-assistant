@@ -171,7 +171,20 @@ export default function FileEditBlock({ text }: Props) {
   if (fileEdits.length === 0 && !hasDeleteMarker) {
     return (
       <div className="prose prose-invert prose-sm max-w-none">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            em: ({ children }) => (
+              <em className="not-italic text-purple-300/75">
+                <span className="opacity-40 select-none">*</span>
+                {children}
+                <span className="opacity-40 select-none">*</span>
+              </em>
+            ),
+          }}
+        >
+          {text}
+        </ReactMarkdown>
       </div>
     );
   }
@@ -184,7 +197,20 @@ export default function FileEditBlock({ text }: Props) {
         seg.kind === "prose" ? (
           seg.text.trim() ? (
             <div key={i} className="prose prose-invert prose-sm max-w-none">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.text}</ReactMarkdown>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  em: ({ children }) => (
+                    <em className="not-italic text-purple-300/75">
+                      <span className="opacity-40 select-none">*</span>
+                      {children}
+                      <span className="opacity-40 select-none">*</span>
+                    </em>
+                  ),
+                }}
+              >
+                {seg.text}
+              </ReactMarkdown>
             </div>
           ) : null
         ) : seg.kind === "delete" ? (
