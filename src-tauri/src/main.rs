@@ -4,6 +4,7 @@
 )]
 
 mod ai_bridge;
+mod clipboard;
 mod overlay;
 mod project_indexer;
 mod screen_capture;
@@ -35,6 +36,10 @@ fn main() {
         })
         .setup(|app| {
             let app_handle = app.handle();
+
+            // ── Cursor tracker (auto click-through on transparent areas) ──
+            let win_tracker = app_handle.get_window("main").unwrap();
+            overlay::spawn_cursor_tracker(win_tracker);
 
             // ── Global hotkeys ────────────────────────────────────────
             // Registration is best-effort: some keys may be claimed by the
@@ -83,7 +88,13 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay::set_click_through,
             overlay::set_always_on_top,
+            overlay::set_dialog_open,
+            overlay::set_window_mode,
             overlay::get_click_through_state,
+            overlay::toggle_ghost_mode,
+            overlay::get_ghost_mode_state,
+            overlay::set_ghost_mode,
+            overlay::set_panel_x,
             screen_capture::capture_screen,
             screen_capture::capture_window_under_cursor,
             ai_bridge::analyze_with_openai,
@@ -92,12 +103,15 @@ fn main() {
             project_indexer::read_file_content,
             project_indexer::write_file,
             project_indexer::patch_file,
+            project_indexer::delete_file,
             ai_bridge::analyze_with_deepseek,
             ai_bridge::analyze_with_openrouter,
             ai_bridge::analyze_with_local,
+            ai_bridge::cancel_ai_request,
             web_search::web_search,
             web_search::fetch_url_content,
             web_search::search_and_fetch,
+            clipboard::get_clipboard_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

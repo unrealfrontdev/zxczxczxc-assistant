@@ -8,7 +8,7 @@ description = "Universal AI Assistant Overlay"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [ "fs-create-dir", "fs-write-file",
+tauri = { version = "1", features = [ "clipboard-read-text", "clipboard-write-text", "fs-create-dir", "fs-write-file",
   "global-shortcut-all",
   "window-all",
   "dialog-open",
@@ -29,6 +29,8 @@ env_logger  = "0.10"
 image       = "0.24"
 walkdir     = "2"
 regex       = { version = "1", default-features = false, features = ["std"] }
+arboard     = "3"
+png         = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

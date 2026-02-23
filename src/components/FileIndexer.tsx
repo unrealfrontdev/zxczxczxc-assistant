@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { open } from "@tauri-apps/api/dialog";
+import { openDirSafe } from "../utils/dialog";
 import { useAssistantStore } from "../store/assistantStore";
 
 export default function FileIndexer() {
@@ -9,8 +9,8 @@ export default function FileIndexer() {
   const [expanded, setExpanded] = useState(false);
 
   const handleBrowse = async () => {
-    const selected = await open({ directory: true, multiple: false, title: "Select project folder" });
-    if (typeof selected !== "string") return;
+    const selected = await openDirSafe("Select project folder");
+    if (!selected) return;
 
     setLoading(true);
     setError(null);

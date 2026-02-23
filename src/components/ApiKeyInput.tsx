@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useAssistantStore, AiProvider } from "../store/assistantStore";
+import { useAssistantStore, AiProvider, LANGUAGE_NAMES } from "../store/assistantStore";
 
 const MODELS: Record<AiProvider, string[]> = {
   openai: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1-preview"],
@@ -46,6 +46,7 @@ export default function ApiKeyInput() {
   const {
     apiKey, setApiKey, provider, setProvider, model, setModel,
     localUrl, setLocalUrl,
+    responseLanguage, setResponseLanguage,
   } = useAssistantStore();
 
   const [open,    setOpen]    = useState(!apiKey && provider !== "local");
@@ -238,6 +239,25 @@ export default function ApiKeyInput() {
               </p>
             </>
           )}
+          {/* ── Response Language ── */}
+          <div className="space-y-1">
+            <label className="text-[10px] text-white/40 font-medium tracking-wide uppercase">
+              🌐 Response language
+            </label>
+            <select
+              value={responseLanguage}
+              onChange={(e) => setResponseLanguage(e.target.value)}
+              className="w-full bg-white/10 rounded-lg px-2 py-1.5 text-[11px]
+                focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="auto" className="bg-gray-800 text-white">Auto (match user language)</option>
+              {Object.entries(LANGUAGE_NAMES).map(([code, label]) => (
+                <option key={code} value={code} className="bg-gray-800 text-white">
+                  {label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
       )}
     </div>

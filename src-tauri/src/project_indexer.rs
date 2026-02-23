@@ -183,6 +183,30 @@ pub async fn write_file(file_path: String, content: String) -> Result<(), String
     Ok(())
 }
 
+/// Delete a single file from disk.
+/// Returns an error if the path does not exist or is a directory.
+#[tauri::command]
+pub async fn delete_file(file_path: String) -> Result<(), String> {
+    if file_path.is_empty() {
+        return Err("file_path must not be empty".into());
+    }
+    let path = Path::new(&file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+    if path.is_dir() {
+        return Err(format!(
+            "'{}' is a directory — use delete_directory to remove directories",
+            file_path
+        ));
+    }
+    std::fs::remove_file(path)
+        .map_err(|e| format!("Failed to delete '{}': {}", file_path, e))?;
+
+    log::info!("delete_file: deleted {}", file_path);
+    Ok(())
+}
+
 /// Apply a targeted string replacement inside a file.
 /// Fails if `old_text` is not found exactly once.
 #[tauri::command]

@@ -2,6 +2,30 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
+use tokio::sync::watch;
+
+// ── Global cancellation channel ──────────────────────────────────────────
+
+static CANCEL_TX: OnceLock<watch::Sender<u64>> = OnceLock::new();
+
+fn cancel_tx() -> &'static watch::Sender<u64> {
+    CANCEL_TX.get_or_init(|| watch::channel(0).0)
+}
+
+/// Subscribe to the cancel channel and bump the generation counter so that
+/// any in-flight request sees the change via `watch::Receiver::changed()`.
+fn new_cancel_receiver() -> watch::Receiver<u64> {
+    cancel_tx().subscribe()
+}
+
+/// Cancel the in-flight request (if any). Called from the frontend.
+#[tauri::command]
+pub fn cancel_ai_request() {
+    let tx = cancel_tx();
+    let next = *tx.borrow() + 1;
+    let _ = tx.send(next);
+}
 
 // ── Shared request/response types ───────────────────────────────────────
 
@@ -158,60 +182,61 @@ pub async fn analyze_with_openai(req: AiRequest) -> Result<AiResponse, String> {
         return Err("OpenAI API key is required".into());
     }
 
-    let client = http_client().map_err(|e| e.to_string())?;
-    let model  = req.model.as_deref().unwrap_or("gpt-4o");
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = async {
+            let client = http_client().map_err(|e| e.to_string())?;
+            let model  = req.model.as_deref().unwrap_or("gpt-4o");
 
-    // Build multi-modal content array
-    let mut content: Vec<Value> = vec![json!({
-        "type": "text",
-        "text": build_prompt(&req)
-    })];
+            let mut content: Vec<Value> = vec![json!({
+                "type": "text",
+                "text": build_prompt(&req)
+            })];
 
-    if let Some(b64) = &req.image_base64 {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url":    format!("data:image/png;base64,{}", b64),
-                "detail": "high"
+            if let Some(b64) = &req.image_base64 {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url":    format!("data:image/png;base64,{}", b64),
+                        "detail": "high"
+                    }
+                }));
             }
-        }));
+
+            let body = json!({
+                "model":      model,
+                "messages":   [{ "role": "user", "content": content }],
+                "max_tokens": 2048
+            });
+
+            let resp = client
+                .post("https://api.openai.com/v1/chat/completions")
+                .bearer_auth(&req.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+
+            let status = resp.status();
+            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "OpenAI {}: {}",
+                    status,
+                    json["error"]["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+
+            Ok(AiResponse {
+                text: json["choices"][0]["message"]["content"]
+                    .as_str().unwrap_or("").to_string(),
+                model: json["model"].as_str().unwrap_or(model).to_string(),
+                tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
+            })
+        } => result,
+        _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
-
-    let body = json!({
-        "model":      model,
-        "messages":   [{ "role": "user", "content": content }],
-        "max_tokens": 2048
-    });
-
-    let resp = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(&req.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    let status = resp.status();
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if !status.is_success() {
-        return Err(format!(
-            "OpenAI {}: {}",
-            status,
-            json["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
-    }
-
-    Ok(AiResponse {
-        text: json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-        model: json["model"].as_str().unwrap_or(model).to_string(),
-        tokens_used: json["usage"]["total_tokens"]
-            .as_u64()
-            .map(|n| n as u32),
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -224,69 +249,59 @@ pub async fn analyze_with_claude(req: AiRequest) -> Result<AiResponse, String> {
         return Err("Anthropic API key is required".into());
     }
 
-    let client = http_client().map_err(|e| e.to_string())?;
-    let model  = req
-        .model
-        .as_deref()
-        .unwrap_or("claude-3-5-sonnet-20241022");
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = async {
+            let client = http_client().map_err(|e| e.to_string())?;
+            let model  = req.model.as_deref().unwrap_or("claude-3-5-sonnet-20241022");
 
-    let mut content: Vec<Value> = Vec::new();
-
-    // Image must come before the text block for Claude
-    if let Some(b64) = &req.image_base64 {
-        content.push(json!({
-            "type": "image",
-            "source": {
-                "type":       "base64",
-                "media_type": "image/png",
-                "data":       b64
+            let mut content: Vec<Value> = Vec::new();
+            if let Some(b64) = &req.image_base64 {
+                content.push(json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": b64 }
+                }));
             }
-        }));
+            content.push(json!({ "type": "text", "text": build_prompt(&req) }));
+
+            let body = json!({
+                "model":      model,
+                "max_tokens": 2048,
+                "messages":   [{ "role": "user", "content": content }]
+            });
+
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key",         &req.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type",      "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+
+            let status = resp.status();
+            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "Claude {}: {}",
+                    status,
+                    json["error"]["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+
+            let in_tok  = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+            let out_tok = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
+
+            Ok(AiResponse {
+                text: json["content"][0]["text"].as_str().unwrap_or("").to_string(),
+                model: json["model"].as_str().unwrap_or(model).to_string(),
+                tokens_used: Some((in_tok + out_tok) as u32),
+            })
+        } => result,
+        _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
-
-    content.push(json!({
-        "type": "text",
-        "text": build_prompt(&req)
-    }));
-
-    let body = json!({
-        "model":      model,
-        "max_tokens": 2048,
-        "messages":   [{ "role": "user", "content": content }]
-    });
-
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key",          &req.api_key)
-        .header("anthropic-version",  "2023-06-01")
-        .header("content-type",       "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    let status = resp.status();
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if !status.is_success() {
-        return Err(format!(
-            "Claude {}: {}",
-            status,
-            json["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
-    }
-
-    let input_tok  = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
-    let output_tok = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
-
-    Ok(AiResponse {
-        text: json["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-        model: json["model"].as_str().unwrap_or(model).to_string(),
-        tokens_used: Some((input_tok + output_tok) as u32),
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -299,61 +314,57 @@ pub async fn analyze_with_deepseek(req: AiRequest) -> Result<AiResponse, String>
         return Err("DeepSeek API key is required".into());
     }
 
-    let client = http_client().map_err(|e| e.to_string())?;
-    let model  = req.model.as_deref().unwrap_or("deepseek-chat");
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = async {
+            let client = http_client().map_err(|e| e.to_string())?;
+            let model  = req.model.as_deref().unwrap_or("deepseek-chat");
 
-    // DeepSeek uses OpenAI-compatible chat format.
-    // Vision (image) is supported only on deepseek-chat v3+; we include it
-    // when provided and let the API return an error for unsupported models.
-    let mut content: Vec<Value> = vec![json!({
-        "type": "text",
-        "text": build_prompt(&req)
-    })];
-
-    if let Some(b64) = &req.image_base64 {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": format!("data:image/png;base64,{}", b64)
+            let mut content: Vec<Value> = vec![json!({
+                "type": "text",
+                "text": build_prompt(&req)
+            })];
+            if let Some(b64) = &req.image_base64 {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
+                }));
             }
-        }));
+
+            let body = json!({
+                "model":      model,
+                "messages":   [{ "role": "user", "content": content }],
+                "max_tokens": 2048
+            });
+
+            let resp = client
+                .post("https://api.deepseek.com/v1/chat/completions")
+                .bearer_auth(&req.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+
+            let status = resp.status();
+            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "DeepSeek {}: {}",
+                    status,
+                    json["error"]["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+
+            Ok(AiResponse {
+                text: json["choices"][0]["message"]["content"]
+                    .as_str().unwrap_or("").to_string(),
+                model: json["model"].as_str().unwrap_or(model).to_string(),
+                tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
+            })
+        } => result,
+        _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
-
-    let body = json!({
-        "model":      model,
-        "messages":   [{ "role": "user", "content": content }],
-        "max_tokens": 2048
-    });
-
-    let resp = client
-        .post("https://api.deepseek.com/v1/chat/completions")
-        .bearer_auth(&req.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    let status = resp.status();
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if !status.is_success() {
-        return Err(format!(
-            "DeepSeek {}: {}",
-            status,
-            json["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
-    }
-
-    Ok(AiResponse {
-        text: json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-        model: json["model"].as_str().unwrap_or(model).to_string(),
-        tokens_used: json["usage"]["total_tokens"]
-            .as_u64()
-            .map(|n| n as u32),
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -366,60 +377,59 @@ pub async fn analyze_with_openrouter(req: AiRequest) -> Result<AiResponse, Strin
         return Err("OpenRouter API key is required".into());
     }
 
-    let client = http_client().map_err(|e| e.to_string())?;
-    let model  = req.model.as_deref().unwrap_or("openai/gpt-4o");
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = async {
+            let client = http_client().map_err(|e| e.to_string())?;
+            let model  = req.model.as_deref().unwrap_or("openai/gpt-4o");
 
-    let mut content: Vec<Value> = vec![json!({
-        "type": "text",
-        "text": build_prompt(&req)
-    })];
-
-    if let Some(b64) = &req.image_base64 {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": format!("data:image/png;base64,{}", b64)
+            let mut content: Vec<Value> = vec![json!({
+                "type": "text",
+                "text": build_prompt(&req)
+            })];
+            if let Some(b64) = &req.image_base64 {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
+                }));
             }
-        }));
+
+            let body = json!({
+                "model":      model,
+                "messages":   [{ "role": "user", "content": content }],
+                "max_tokens": 2048
+            });
+
+            let resp = client
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .bearer_auth(&req.api_key)
+                .header("HTTP-Referer", "https://github.com/ai-assistant")
+                .header("X-Title",     "AI Assistant Overlay")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+
+            let status = resp.status();
+            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "OpenRouter {}: {}",
+                    status,
+                    json["error"]["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+
+            Ok(AiResponse {
+                text: json["choices"][0]["message"]["content"]
+                    .as_str().unwrap_or("").to_string(),
+                model: json["model"].as_str().unwrap_or(model).to_string(),
+                tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
+            })
+        } => result,
+        _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
-
-    let body = json!({
-        "model":      model,
-        "messages":   [{ "role": "user", "content": content }],
-        "max_tokens": 2048
-    });
-
-    let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(&req.api_key)
-        .header("HTTP-Referer", "https://github.com/ai-assistant")
-        .header("X-Title",     "AI Assistant Overlay")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    let status = resp.status();
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if !status.is_success() {
-        return Err(format!(
-            "OpenRouter {}: {}",
-            status,
-            json["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
-    }
-
-    Ok(AiResponse {
-        text: json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-        model: json["model"].as_str().unwrap_or(model).to_string(),
-        tokens_used: json["usage"]["total_tokens"]
-            .as_u64()
-            .map(|n| n as u32),
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -435,95 +445,86 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
         );
     }
 
-    // If the caller already provided a full path (e.g. /api/v1/chat) use it
-    // directly; otherwise fall back to the standard OpenAI-compatible path.
-    let url = {
-        // A path exists when there's a '/' after the host[:port] part
-        let has_path = base.split("://").nth(1).map(|s| s.contains('/')).unwrap_or(false);
-        if has_path {
-            base.to_string()
-        } else {
-            format!("{}/v1/chat/completions", base)
-        }
+    let has_path = base.split("://").nth(1).map(|s| s.contains('/')).unwrap_or(false);
+    let url = if has_path {
+        base.to_string()
+    } else {
+        format!("{}/v1/chat/completions", base)
     };
 
     log::info!("local LLM → {}", url);
 
-    let client = http_client().map_err(|e| e.to_string())?;
-    let model  = req.model.as_deref().unwrap_or("local-model");
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = async {
+            let client = http_client().map_err(|e| e.to_string())?;
+            let model  = req.model.as_deref().unwrap_or("local-model");
 
-    // Re-use build_prompt for RAG context injection
-    let proxy_req = AiRequest {
-        api_key:       req.api_key.clone().unwrap_or_default(),
-        prompt:        req.prompt.clone(),
-        image_base64:  req.image_base64.clone(),
-        context_files: req.context_files.clone(),
-        model:         req.model.clone(),
-    };
-
-    let mut content: Vec<Value> = vec![json!({
-        "type": "text",
-        "text": build_prompt(&proxy_req)
-    })];
-
-    // Include screenshot when the local model supports vision
-    if let Some(b64) = &req.image_base64 {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": { "url": format!("data:image/png;base64,{}", b64) }
-        }));
-    }
-
-    let body = json!({
-        "model":      model,
-        "messages":   [{ "role": "user", "content": content }],
-        "max_tokens": 4096,
-        "stream":     false
-    });
-
-    let mut builder = client.post(&url).json(&body);
-    if let Some(key) = &req.api_key {
-        if !key.is_empty() {
-            builder = builder.bearer_auth(key);
-        }
-    }
-
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| {
-            let reason = if e.is_timeout() {
-                "соединение превысило таймаут (сервер не ответил вовремя)".to_string()
-            } else if e.is_connect() {
-                "не удалось подключиться (сервер не запущен или порт закрыт)".to_string()
-            } else {
-                e.to_string()
+            let proxy_req = AiRequest {
+                api_key:       req.api_key.clone().unwrap_or_default(),
+                prompt:        req.prompt.clone(),
+                image_base64:  req.image_base64.clone(),
+                context_files: req.context_files.clone(),
+                model:         req.model.clone(),
             };
-            format!(
-                "Локальная модель недоступна: {}\n\nURL: {}\n\nПодсказки:\n• Запущен ли сервер и загружена ли модель?\n• LM Studio: вкладка 'Local Server' → зелёная кнопка + модель выбрана\n• LM Studio → http://127.0.0.1:PORT  (не localhost!)\n• Ollama → http://127.0.0.1:11434",
-                reason, url
-            )
-        })?;
 
-    let status = resp.status();
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let mut content: Vec<Value> = vec![json!({
+                "type": "text",
+                "text": build_prompt(&proxy_req)
+            })];
+            if let Some(b64) = &req.image_base64 {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
+                }));
+            }
 
-    if !status.is_success() {
-        return Err(format!(
-            "Local LLM {}: {}",
-            status,
-            json["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
+            let body = json!({
+                "model":      model,
+                "messages":   [{ "role": "user", "content": content }],
+                "max_tokens": 4096,
+                "stream":     false
+            });
+
+            let mut builder = client.post(&url).json(&body);
+            if let Some(key) = &req.api_key {
+                if !key.is_empty() {
+                    builder = builder.bearer_auth(key);
+                }
+            }
+
+            let resp = builder.send().await.map_err(|e| {
+                let reason = if e.is_timeout() {
+                    "соединение превысило таймаут (сервер не ответил вовремя)".to_string()
+                } else if e.is_connect() {
+                    "не удалось подключиться (сервер не запущен или порт закрыт)".to_string()
+                } else {
+                    e.to_string()
+                };
+                format!(
+                    "Локальная модель недоступна: {}\n\nURL: {}\n\nПодсказки:\n• LM Studio: вкладка 'Local Server' → зелёная кнопка + модель выбрана\n• LM Studio → http://127.0.0.1:PORT  (не localhost!)\n• Ollama → http://127.0.0.1:11434",
+                    reason, url
+                )
+            })?;
+
+            let status = resp.status();
+            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "Local LLM {}: {}",
+                    status,
+                    json["error"]["message"].as_str().unwrap_or("unknown error")
+                ));
+            }
+
+            Ok(AiResponse {
+                text: json["choices"][0]["message"]["content"]
+                    .as_str().unwrap_or("").to_string(),
+                model: json["model"].as_str().unwrap_or(model).to_string(),
+                tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
+            })
+        } => result,
+        _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
-
-    Ok(AiResponse {
-        text: json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-        model: json["model"].as_str().unwrap_or(model).to_string(),
-        tokens_used: json["usage"]["total_tokens"]
-            .as_u64()
-            .map(|n| n as u32),
-    })
 }

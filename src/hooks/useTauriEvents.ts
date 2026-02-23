@@ -7,17 +7,20 @@ import { useAssistantStore } from "../store/assistantStore";
  * Call once at the top-level App component.
  */
 export function useTauriEvents() {
-  const { setClickThrough, triggerCapture } = useAssistantStore();
+  const { setClickThrough, setGhostMode, triggerCapture } = useAssistantStore();
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
 
-    // Overlay mode changes emitted by Rust
+    // Rust emits these events immediately (before the slow GTK call)
     listen<boolean>("click-through-changed", (e) => {
       setClickThrough(e.payload);
     }).then((fn) => unlisteners.push(fn));
 
-    // Alt+Shift+S hotkey → instant capture
+    listen<boolean>("ghost-mode-changed", (e) => {
+      setGhostMode(e.payload);
+    }).then((fn) => unlisteners.push(fn));
+
     listen("trigger-screenshot", () => {
       triggerCapture();
     }).then((fn) => unlisteners.push(fn));
