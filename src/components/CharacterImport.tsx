@@ -64,13 +64,20 @@ export default function CharacterImport() {
         const json     = JSON.parse(atob(charaB64));
         const parsed   = parseCharacterCardJson(json);
 
-        // ── Extract avatar (the PNG itself becomes the avatar) ──
-        const avatarBase64 = uint8ToBase64(bytes);
+        // ── Extract avatar — compress to a small thumbnail to stay
+        //    within localStorage quota (large PNGs can be 5 MB+). ──
+        let avatarDataUri: string | undefined;
+        try {
+          avatarDataUri = await compressAvatar(bytes);
+        } catch {
+          // non-fatal — import without avatar rather than failing entirely
+          avatarDataUri = undefined;
+        }
 
         const card: CharacterCard = {
           ...parsed,
           id:           crypto.randomUUID(),
-          avatarBase64,
+          avatarBase64: avatarDataUri,
           importedAt:   Date.now(),
         };
         addCharacter(card);
@@ -200,7 +207,11 @@ function CharCard({ char, isActive, isExpanded, onToggleExpand, onActivate, onDe
         {/* Avatar */}
         {char.avatarBase64 ? (
           <img
-            src={`data:image/png;base64,${char.avatarBase64}`}
+            src={
+              char.avatarBase64.startsWith("data:")
+                ? char.avatarBase64
+                : `data:image/png;base64,${char.avatarBase64}`
+            }
             alt={char.name}
             className="w-8 h-8 rounded-full object-cover border border-white/10 shrink-0"
           />
@@ -320,12 +331,30 @@ function Field({ label, value }: { label: string; value: string }) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/** Convert Uint8Array to base64 without hitting the stack limit on large buffers */
-function uint8ToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
+/**
+ * Downscale the avatar PNG to a ≤200×200 JPEG thumbnail and return a
+ * full data-URI (data:image/jpeg;base64,…). Storing a small JPEG instead
+ * of the raw PNG prevents QuotaExceededError in localStorage.
+ */
+function compressAvatar(bytes: Uint8Array, maxPx = 200): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([bytes], { type: "image/png" });
+    const url  = URL.createObjectURL(blob);
+    const img  = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale  = Math.min(1, maxPx / Math.max(img.width || 1, img.height || 1));
+      const w      = Math.max(1, Math.round(img.width  * scale));
+      const h      = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width  = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { reject(new Error("Canvas 2D not available")); return; }
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image decode failed")); };
+    img.src = url;
+  });
 }

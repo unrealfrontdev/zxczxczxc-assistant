@@ -33,6 +33,8 @@ pub fn cancel_ai_request() {
 pub struct AiRequest {
     pub api_key:       String,
     pub prompt:        String,
+    /// Optional system-level instruction (character card, language directive, etc.)
+    pub system_prompt: Option<String>,
     /// PNG screenshot encoded as base64 (optional)
     pub image_base64:  Option<String>,
     /// RAG context chunks: each element is a formatted file block
@@ -49,6 +51,8 @@ pub struct LocalAiRequest {
     /// Optional Bearer token — most local servers don't require one
     pub api_key:       Option<String>,
     pub prompt:        String,
+    /// Optional system-level instruction (character card, language directive, etc.)
+    pub system_prompt: Option<String>,
     pub image_base64:  Option<String>,
     pub context_files: Option<Vec<String>>,
     pub model:         Option<String>,
@@ -75,6 +79,7 @@ mod tests {
         let req = AiRequest {
             api_key:       "key".into(),
             prompt:        "What is this?".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: None,
             model:         None,
@@ -87,6 +92,7 @@ mod tests {
         let req = AiRequest {
             api_key:       "key".into(),
             prompt:        "Explain this code".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: Some(vec!["### main.rs\n```rust\nfn main(){}\n```".into()]),
             model:         None,
@@ -102,6 +108,7 @@ mod tests {
         let req = AiRequest {
             api_key:       "key".into(),
             prompt:        "Hello".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: Some(vec![]),      // empty vec
             model:         None,
@@ -115,6 +122,7 @@ mod tests {
         let result = rt.block_on(analyze_with_openai(AiRequest {
             api_key:       "".into(),
             prompt:        "test".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: None,
             model:         None,
@@ -129,6 +137,7 @@ mod tests {
         let result = rt.block_on(analyze_with_claude(AiRequest {
             api_key:       "".into(),
             prompt:        "test".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: None,
             model:         None,
@@ -142,6 +151,7 @@ mod tests {
         let result = rt.block_on(analyze_with_deepseek(AiRequest {
             api_key:       "".into(),
             prompt:        "test".into(),
+            system_prompt: None,
             image_base64:  None,
             context_files: None,
             model:         None,
@@ -188,6 +198,14 @@ pub async fn analyze_with_openai(req: AiRequest) -> Result<AiResponse, String> {
             let client = http_client().map_err(|e| e.to_string())?;
             let model  = req.model.as_deref().unwrap_or("gpt-4o");
 
+            let mut messages: Vec<Value> = Vec::new();
+            // Character / language directive goes as a true system message
+            if let Some(sys) = &req.system_prompt {
+                if !sys.trim().is_empty() {
+                    messages.push(json!({ "role": "system", "content": sys }));
+                }
+            }
+
             let mut content: Vec<Value> = vec![json!({
                 "type": "text",
                 "text": build_prompt(&req)
@@ -203,9 +221,11 @@ pub async fn analyze_with_openai(req: AiRequest) -> Result<AiResponse, String> {
                 }));
             }
 
+            messages.push(json!({ "role": "user", "content": content }));
+
             let body = json!({
                 "model":      model,
-                "messages":   [{ "role": "user", "content": content }],
+                "messages":   messages,
                 "max_tokens": 2048
             });
 
@@ -264,11 +284,16 @@ pub async fn analyze_with_claude(req: AiRequest) -> Result<AiResponse, String> {
             }
             content.push(json!({ "type": "text", "text": build_prompt(&req) }));
 
-            let body = json!({
+            // Claude uses a top-level "system" field, not a message role
+            let sys = req.system_prompt.as_deref().unwrap_or("").trim();
+            let mut body = json!({
                 "model":      model,
                 "max_tokens": 2048,
                 "messages":   [{ "role": "user", "content": content }]
             });
+            if !sys.is_empty() {
+                body["system"] = json!(sys);
+            }
 
             let resp = client
                 .post("https://api.anthropic.com/v1/messages")
@@ -320,20 +345,20 @@ pub async fn analyze_with_deepseek(req: AiRequest) -> Result<AiResponse, String>
             let client = http_client().map_err(|e| e.to_string())?;
             let model  = req.model.as_deref().unwrap_or("deepseek-chat");
 
-            let mut content: Vec<Value> = vec![json!({
-                "type": "text",
-                "text": build_prompt(&req)
-            })];
-            if let Some(b64) = &req.image_base64 {
-                content.push(json!({
-                    "type": "image_url",
-                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
-                }));
+            let mut messages: Vec<Value> = Vec::new();
+            if let Some(sys) = &req.system_prompt {
+                if !sys.trim().is_empty() {
+                    messages.push(json!({ "role": "system", "content": sys }));
+                }
             }
+
+            // DeepSeek has no vision support — always use a plain string content
+            let user_content: Value = json!(build_prompt(&req));
+            messages.push(json!({ "role": "user", "content": user_content }));
 
             let body = json!({
                 "model":      model,
-                "messages":   [{ "role": "user", "content": content }],
+                "messages":   messages,
                 "max_tokens": 2048
             });
 
@@ -383,20 +408,27 @@ pub async fn analyze_with_openrouter(req: AiRequest) -> Result<AiResponse, Strin
             let client = http_client().map_err(|e| e.to_string())?;
             let model  = req.model.as_deref().unwrap_or("openai/gpt-4o");
 
-            let mut content: Vec<Value> = vec![json!({
-                "type": "text",
-                "text": build_prompt(&req)
-            })];
-            if let Some(b64) = &req.image_base64 {
-                content.push(json!({
-                    "type": "image_url",
-                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
-                }));
+            let mut messages: Vec<Value> = Vec::new();
+            if let Some(sys) = &req.system_prompt {
+                if !sys.trim().is_empty() {
+                    messages.push(json!({ "role": "system", "content": sys }));
+                }
             }
+
+            // Use image array only when a screenshot is attached; plain string otherwise
+            let user_msg = if let Some(b64) = &req.image_base64 {
+                json!({ "role": "user", "content": [
+                    { "type": "text", "text": build_prompt(&req) },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64) } }
+                ]})
+            } else {
+                json!({ "role": "user", "content": build_prompt(&req) })
+            };
+            messages.push(user_msg);
 
             let body = json!({
                 "model":      model,
-                "messages":   [{ "role": "user", "content": content }],
+                "messages":   messages,
                 "max_tokens": 2048
             });
 
@@ -463,25 +495,35 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
             let proxy_req = AiRequest {
                 api_key:       req.api_key.clone().unwrap_or_default(),
                 prompt:        req.prompt.clone(),
+                system_prompt: req.system_prompt.clone(),
                 image_base64:  req.image_base64.clone(),
                 context_files: req.context_files.clone(),
                 model:         req.model.clone(),
             };
 
-            let mut content: Vec<Value> = vec![json!({
-                "type": "text",
-                "text": build_prompt(&proxy_req)
-            })];
-            if let Some(b64) = &req.image_base64 {
-                content.push(json!({
-                    "type": "image_url",
-                    "image_url": { "url": format!("data:image/png;base64,{}", b64) }
-                }));
+            let mut messages: Vec<Value> = Vec::new();
+            if let Some(sys) = &proxy_req.system_prompt {
+                if !sys.trim().is_empty() {
+                    messages.push(json!({ "role": "system", "content": sys }));
+                }
             }
+
+            // Use multimodal array only when an image is supplied; otherwise
+            // send a plain string — many local models reject the array format
+            // for text-only requests.
+            let user_msg = if let Some(b64) = &req.image_base64 {
+                json!({ "role": "user", "content": [
+                    { "type": "text", "text": build_prompt(&proxy_req) },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64) } }
+                ]})
+            } else {
+                json!({ "role": "user", "content": build_prompt(&proxy_req) })
+            };
+            messages.push(user_msg);
 
             let body = json!({
                 "model":      model,
-                "messages":   [{ "role": "user", "content": content }],
+                "messages":   messages,
                 "max_tokens": 4096,
                 "stream":     false
             });

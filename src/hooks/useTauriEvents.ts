@@ -10,6 +10,13 @@ import { useAssistantStore } from "../store/assistantStore";
 export function useTauriEvents() {
   const { setClickThrough, setGhostMode, triggerCapture, windowMode } = useAssistantStore();
 
+  // ── Safety: reset volatile loading state on every mount ────────────────
+  // `isLoading` is not persisted, but can get stuck at `true` after a hot
+  // reload or app crash where the sendMessage finally-block never ran.
+  useEffect(() => {
+    useAssistantStore.setState({ isLoading: false });
+  }, []);
+
   // ── Restore last-used window mode on startup ────────────────────────────
   useEffect(() => {
     invoke("set_window_mode", {

@@ -5,6 +5,31 @@ import { invoke } from "@tauri-apps/api/tauri";
 // Module-level cancel hook — not stored in Zustand state (not serialisable)
 let _cancelFn: (() => void) | null = null;
 
+// ── Fault-tolerant localStorage wrapper ───────────────────────────────────
+// Catches QuotaExceededError on write so it never crashes the store.
+// On quota failure it removes the key entirely (better than a stuck state).
+const safeStorage = createJSONStorage(() => ({
+  getItem:    (key: string) => localStorage.getItem(key),
+  removeItem: (key: string) => localStorage.removeItem(key),
+  setItem:    (key: string, value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      // QuotaExceededError: clear only our key and retry once
+      try {
+        localStorage.removeItem(key);
+        localStorage.setItem(key, value);
+      } catch {
+        // Still failing — silently skip; in-memory state is authoritative
+        console.warn("[store] localStorage write failed (quota), state not persisted:", e);
+      }
+    }
+  },
+}));
+
+// Clean up the old v1 key so it stops wasting localStorage space
+try { localStorage.removeItem("ai-assistant-v1"); } catch { /* ignore */ }
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export type AiProvider = "openai" | "claude" | "deepseek" | "openrouter" | "local";
@@ -343,7 +368,7 @@ export const useAssistantStore = create<AssistantState>()(
       setProvider: (p) => set({ provider: p }),
       model: "gpt-4o",
       setModel: (m) => set({ model: m }),
-      localUrl: "http://127.0.0.1:1234/api/v1/chat",
+      localUrl: "http://127.0.0.1:1234/v1/chat/completions",
       setLocalUrl: (url) => set({ localUrl: url }),
 
       // ── Capture ────────────────────────────────────────────────────
@@ -381,8 +406,19 @@ export const useAssistantStore = create<AssistantState>()(
         const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages,
                 webSearchEnabled, searchBackend, searchApiKey, searxngUrl,
                 characters, activeCharacterId, responseLanguage } = get();
-        if (provider !== "local" && !apiKey) return;
-        if (!prompt.trim()) return;
+
+        if (!prompt.trim() && !capturedImage) return;
+
+        if (provider !== "local" && !apiKey) {
+          const errMsg: ChatMessage = {
+            id:        crypto.randomUUID(),
+            role:      "assistant",
+            text:      "**No API key configured.**\n\nOpen ⚙ Settings and enter your API key for the selected provider.",
+            timestamp: Date.now(),
+          };
+          set((s) => ({ messages: [...s.messages, errMsg] }));
+          return;
+        }
 
         // Add user message to history
         const userMsg: ChatMessage = {
@@ -392,7 +428,19 @@ export const useAssistantStore = create<AssistantState>()(
           imageBase64:  capturedImage ?? undefined,
           timestamp:    Date.now(),
         };
-        set((s) => ({ messages: [...s.messages, userMsg], prompt: "", isLoading: true }));
+        // Guard: ensure isLoading is always reset even if persist throws
+        try {
+          set((s) => ({ messages: [...s.messages, userMsg], prompt: "", isLoading: true }));
+        } catch {
+          set({ isLoading: false });
+          throw new Error("Failed to update state before sending. Try again.");
+        }
+
+        // ── Cancellation token — set before any await so Stop always works ──
+        let _masterReject: ((e: Error) => void) | null = null;
+        const masterCancel = new Promise<never>((_, reject) => { _masterReject = reject; });
+        void masterCancel.catch(() => {}); // prevent unhandled-rejection if request finishes first
+        _cancelFn = () => { _masterReject?.(new Error("__CANCELLED__")); };
 
         try {
           // Build RAG context blocks (max 20 files, 3 KB each)
@@ -427,10 +475,13 @@ export const useAssistantStore = create<AssistantState>()(
                 max_results:   searchMaxResults,
                 fetch_content: fetchPageContent,
               };
-              const searchRes = await invoke<{
-                results: Array<{ title: string; url: string; snippet: string; content?: string }>;
-                backend: string;
-              }>(command, { req: searchReq });
+              const searchRes = await Promise.race([
+                invoke<{
+                  results: Array<{ title: string; url: string; snippet: string; content?: string }>;
+                  backend: string;
+                }>(command, { req: searchReq }),
+                masterCancel,
+              ]);
 
               if (searchRes.results.length > 0) {
                 webSearchContext = `\n\n---\n🌐 **WEB SEARCH RESULTS** (via ${searchRes.backend}, ${searchRes.results.length} results)\n`;
@@ -444,6 +495,7 @@ export const useAssistantStore = create<AssistantState>()(
                 webSearchContext += "\n---\nAnswer using the search results above. Cite source URLs when relevant. Prefer information from fetched page content over snippets.\n";
               }
             } catch (err) {
+              if (String(err).includes("__CANCELLED__")) throw err; // propagate stop
               console.warn("Web search failed:", err);
               webSearchContext = `\n\n⚠️ Web search failed: ${String(err)}\n`;
             }
@@ -453,23 +505,23 @@ export const useAssistantStore = create<AssistantState>()(
             ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}${webSearchContext}`
             : `${currentText}${webSearchContext}`;
 
-          // Prepend active character system prompt
+          // ── Build character system prompt (sent as a real system message) ──
           const activeChar = activeCharacterId ? characters.find((c) => c.id === activeCharacterId) : null;
-          const charPrefix = activeChar
-            ? `[Character: ${activeChar.name}]\n${[
+          const langPrefix = responseLanguage !== "auto"
+            ? `[IMPORTANT: You must ALWAYS respond exclusively in ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}. Do not switch to any other language regardless of the language the user writes in.]\n\n`
+            : "";
+          const charSystemPrompt: string | null = activeChar
+            ? langPrefix + [
+                `You are ${activeChar.name}.`,
                 activeChar.system_prompt,
                 activeChar.description && `Description: ${activeChar.description}`,
                 activeChar.personality && `Personality: ${activeChar.personality}`,
                 activeChar.scenario    && `Scenario: ${activeChar.scenario}`,
-              ].filter(Boolean).join("\n")}\n\n`
-            : "";
+                activeChar.mes_example && `Example dialogue:\n${activeChar.mes_example}`,
+              ].filter(Boolean).join("\n")
+            : (langPrefix || null);
 
-          // Prepend language instruction when a specific language is selected
-          const langInstruction = responseLanguage !== "auto"
-            ? `[IMPORTANT: You must ALWAYS respond exclusively in ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}. Do not switch to any other language regardless of the language the user writes in.]\n\n`
-            : "";
-
-          const finalPrompt = langInstruction + charPrefix + fullPrompt;
+          const finalPrompt = fullPrompt;
 
           const command =
             provider === "openai"   ? "analyze_with_openai"   :
@@ -483,6 +535,7 @@ export const useAssistantStore = create<AssistantState>()(
                 base_url:      localUrl,
                 api_key:       apiKey || null,
                 prompt:        finalPrompt,
+                system_prompt: charSystemPrompt,
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
@@ -490,21 +543,18 @@ export const useAssistantStore = create<AssistantState>()(
             : {
                 api_key:       apiKey,
                 prompt:        finalPrompt,
+                system_prompt: charSystemPrompt,
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
               };
 
-          const invokePromise = invoke<{ text: string; model: string; tokens_used?: number }>(command, {
-            req: reqPayload,
-          });
-
-          // Build a cancel promise that rejects when _cancelFn is called
-          const cancelPromise = new Promise<never>((_, reject) => {
-            _cancelFn = () => reject(new Error("__CANCELLED__"));
-          });
-
-          const result = await Promise.race([invokePromise, cancelPromise]);
+          const result = await Promise.race([
+            invoke<{ text: string; model: string; tokens_used?: number }>(command, {
+              req: reqPayload,
+            }),
+            masterCancel,
+          ]);
 
           const assistantMsg: ChatMessage = {
             id:        crypto.randomUUID(),
@@ -536,6 +586,9 @@ export const useAssistantStore = create<AssistantState>()(
         invoke("cancel_ai_request").catch(console.error);
         // Then reject the JS-side promise immediately
         if (_cancelFn) { _cancelFn(); _cancelFn = null; }
+        // Always reset loading — guards against stuck state from hot-reload /
+        // previous crashed requests where the finally block never ran.
+        set({ isLoading: false });
       },
 
       clearMessages: () => set({ messages: [], activeSessionId: null }),
@@ -717,29 +770,55 @@ export const useAssistantStore = create<AssistantState>()(
       },
     }),
     {
-      name:    "ai-assistant-v1",
-      storage: createJSONStorage(() => localStorage),
-      // Only persist configuration — not volatile UI state
-      partialize: (s) => ({
-        apiKey:            s.apiKey,
-        provider:          s.provider,
-        model:             s.model,
-        localUrl:          s.localUrl,
-        webSearchEnabled:  s.webSearchEnabled,
-        searchBackend:     s.searchBackend,
-        searchApiKey:      s.searchApiKey,
-        searxngUrl:        s.searxngUrl,
-        fetchPageContent:  s.fetchPageContent,
-        searchMaxResults:  s.searchMaxResults,
-        customPrompts:     s.customPrompts,
-        characters:        s.characters,
-        activeCharacterId: s.activeCharacterId,
-        responseLanguage:  s.responseLanguage,
-        windowMode:        s.windowMode,
-        archivedChats:     s.archivedChats,
-        activeSessionId:   s.activeSessionId,
-        messages:          s.messages,
-      }),
+      // v2: strips imageBase64 from messages and avatarBase64 from characters
+      // to prevent QuotaExceededError. Old v1 key is auto-migrated below.
+      name:    "ai-assistant-v2",
+      storage: safeStorage,
+      version: 2,
+      migrate: (persisted: unknown, fromVersion: number) => {
+        // Carry over settings from v1 / unknown versions, drop heavy blobs
+        const old = (persisted ?? {}) as Record<string, unknown>;
+        if (fromVersion < 2) {
+          // Remove any avatarBase64 blobs from characters
+          const chars = (old.characters as Array<Record<string, unknown>> ?? []).map(
+            ({ avatarBase64: _, ...c }) => c
+          );
+          return { ...old, characters: chars, messages: [], archivedChats: [] };
+        }
+        return old;
+      },
+      partialize: (s) => {
+        // Strip all binary blobs before writing
+        const stripImages = (msgs: ChatMessage[]) =>
+          msgs.map(({ imageBase64: _img, ...m }) => m as ChatMessage);
+
+        return {
+          apiKey:            s.apiKey,
+          provider:          s.provider,
+          model:             s.model,
+          localUrl:          s.localUrl,
+          webSearchEnabled:  s.webSearchEnabled,
+          searchBackend:     s.searchBackend,
+          searchApiKey:      s.searchApiKey,
+          searxngUrl:        s.searxngUrl,
+          fetchPageContent:  s.fetchPageContent,
+          searchMaxResults:  s.searchMaxResults,
+          customPrompts:     s.customPrompts,
+          // Strip avatar blobs — they're displayed from in-memory state only
+          characters: s.characters.map(({ avatarBase64: _av, ...c }) => c as CharacterCard),
+          activeCharacterId: s.activeCharacterId,
+          responseLanguage:  s.responseLanguage,
+          windowMode:        s.windowMode,
+          // Keep only the 50 most recent messages (no images)
+          messages:          stripImages(s.messages.slice(-50)),
+          activeSessionId:   s.activeSessionId,
+          // Keep last 50 sessions, strip images from their messages
+          archivedChats: s.archivedChats.slice(0, 50).map((chat) => ({
+            ...chat,
+            messages: stripImages(chat.messages.slice(-50)),
+          })),
+        };
+      },
     }
   )
 );

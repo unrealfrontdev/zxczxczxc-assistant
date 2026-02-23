@@ -38,7 +38,7 @@ const MODELS: Record<AiProvider, string[]> = {
 };
 
 const LOCAL_PRESETS = [
-  { label: "LM Studio", url: "http://localhost:1234/api/v1/chat" },
+  { label: "LM Studio", url: "http://localhost:1234/v1/chat/completions" },
   { label: "Ollama",    url: "http://localhost:11434" },
 ];
 
