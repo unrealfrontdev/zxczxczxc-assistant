@@ -12,6 +12,9 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Bind to all interfaces so the dev server is reachable from other
+    // devices on the local network. Vite will print the LAN URL on startup.
+    host: true,
   },
   // Prevent vite from hiding Rust errors
   clearScreen: false,

@@ -59,7 +59,7 @@
       "shortDescription": "AI overlay assistant",
       "longDescription":  "Universal AI assistant overlay with screen capture",
       "deb":          { "depends": [] },
-      "targets":      "all",
+      "targets":      ["deb", "rpm"],
       "macOS": {
         "minimumSystemVersion": "12.0",
         "entitlements": "entitlements.plist"

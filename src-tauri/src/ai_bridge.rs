@@ -41,6 +41,8 @@ pub struct AiRequest {
     pub context_files: Option<Vec<String>>,
     /// Override the default model
     pub model:         Option<String>,
+    /// Hard cap on output tokens (None = use provider default)
+    pub max_tokens:    Option<u32>,
 }
 
 /// Request for local LLM servers (LM Studio, Ollama, generic OpenAI-compatible).
@@ -56,6 +58,8 @@ pub struct LocalAiRequest {
     pub image_base64:  Option<String>,
     pub context_files: Option<Vec<String>>,
     pub model:         Option<String>,
+    /// Hard cap on output tokens (None = use server default)
+    pub max_tokens:    Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,6 +179,27 @@ fn build_prompt(req: &AiRequest) -> String {
     full
 }
 
+/// Extract the text reply from an OpenAI-compatible JSON response.
+/// Falls back to the `reasoning` field (used by CoT / "thinking" models like
+/// DeepSeek-R1, LM Studio with heretic/opus-class models) when `content` is
+/// empty or missing.
+fn extract_content(json: &Value) -> String {
+    let msg = &json["choices"][0]["message"];
+    let content = msg["content"].as_str().unwrap_or("").trim();
+    if !content.is_empty() {
+        return content.to_string();
+    }
+    // CoT models: the actual answer lives in 'reasoning' when content is empty
+    let reasoning = msg["reasoning"].as_str().unwrap_or("").trim();
+    if !reasoning.is_empty() {
+        return format!(
+            "{}\n\n*— модель вернула только рассуждения (reasoning). Увеличьте лимит токенов для полного ответа. —*",
+            reasoning
+        );
+    }
+    String::new()
+}
+
 fn http_client() -> reqwest::Result<Client> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -223,10 +248,11 @@ pub async fn analyze_with_openai(req: AiRequest) -> Result<AiResponse, String> {
 
             messages.push(json!({ "role": "user", "content": content }));
 
+            let max_tok = req.max_tokens.unwrap_or(2048);
             let body = json!({
                 "model":      model,
                 "messages":   messages,
-                "max_tokens": 2048
+                "max_tokens": max_tok
             });
 
             let resp = client
@@ -249,9 +275,8 @@ pub async fn analyze_with_openai(req: AiRequest) -> Result<AiResponse, String> {
             }
 
             Ok(AiResponse {
-                text: json["choices"][0]["message"]["content"]
-                    .as_str().unwrap_or("").to_string(),
-                model: json["model"].as_str().unwrap_or(model).to_string(),
+                text:        extract_content(&json),
+                model:       json["model"].as_str().unwrap_or(model).to_string(),
                 tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
             })
         } => result,
@@ -286,9 +311,10 @@ pub async fn analyze_with_claude(req: AiRequest) -> Result<AiResponse, String> {
 
             // Claude uses a top-level "system" field, not a message role
             let sys = req.system_prompt.as_deref().unwrap_or("").trim();
+            let max_tok = req.max_tokens.unwrap_or(2048);
             let mut body = json!({
                 "model":      model,
-                "max_tokens": 2048,
+                "max_tokens": max_tok,
                 "messages":   [{ "role": "user", "content": content }]
             });
             if !sys.is_empty() {
@@ -356,10 +382,11 @@ pub async fn analyze_with_deepseek(req: AiRequest) -> Result<AiResponse, String>
             let user_content: Value = json!(build_prompt(&req));
             messages.push(json!({ "role": "user", "content": user_content }));
 
+            let max_tok = req.max_tokens.unwrap_or(2048);
             let body = json!({
                 "model":      model,
                 "messages":   messages,
-                "max_tokens": 2048
+                "max_tokens": max_tok
             });
 
             let resp = client
@@ -382,9 +409,8 @@ pub async fn analyze_with_deepseek(req: AiRequest) -> Result<AiResponse, String>
             }
 
             Ok(AiResponse {
-                text: json["choices"][0]["message"]["content"]
-                    .as_str().unwrap_or("").to_string(),
-                model: json["model"].as_str().unwrap_or(model).to_string(),
+                text:        extract_content(&json),
+                model:       json["model"].as_str().unwrap_or(model).to_string(),
                 tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
             })
         } => result,
@@ -426,10 +452,11 @@ pub async fn analyze_with_openrouter(req: AiRequest) -> Result<AiResponse, Strin
             };
             messages.push(user_msg);
 
+            let max_tok = req.max_tokens.unwrap_or(2048);
             let body = json!({
                 "model":      model,
                 "messages":   messages,
-                "max_tokens": 2048
+                "max_tokens": max_tok
             });
 
             let resp = client
@@ -454,9 +481,8 @@ pub async fn analyze_with_openrouter(req: AiRequest) -> Result<AiResponse, Strin
             }
 
             Ok(AiResponse {
-                text: json["choices"][0]["message"]["content"]
-                    .as_str().unwrap_or("").to_string(),
-                model: json["model"].as_str().unwrap_or(model).to_string(),
+                text:        extract_content(&json),
+                model:       json["model"].as_str().unwrap_or(model).to_string(),
                 tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
             })
         } => result,
@@ -499,33 +525,47 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
                 image_base64:  req.image_base64.clone(),
                 context_files: req.context_files.clone(),
                 model:         req.model.clone(),
+                max_tokens:    req.max_tokens,
+            };
+
+            // Many local models (e.g. LM Studio with Jinja templates) only
+            // accept "user" and "assistant" roles and reject "system".
+            // Prepend the system prompt to the first user message to be safe.
+            let base_prompt = build_prompt(&proxy_req);
+            let user_text = if let Some(sys) = &proxy_req.system_prompt {
+                let sys = sys.trim();
+                if !sys.is_empty() {
+                    format!("{}\n\n{}", sys, base_prompt)
+                } else {
+                    base_prompt
+                }
+            } else {
+                base_prompt
             };
 
             let mut messages: Vec<Value> = Vec::new();
-            if let Some(sys) = &proxy_req.system_prompt {
-                if !sys.trim().is_empty() {
-                    messages.push(json!({ "role": "system", "content": sys }));
-                }
-            }
 
             // Use multimodal array only when an image is supplied; otherwise
             // send a plain string — many local models reject the array format
             // for text-only requests.
             let user_msg = if let Some(b64) = &req.image_base64 {
                 json!({ "role": "user", "content": [
-                    { "type": "text", "text": build_prompt(&proxy_req) },
+                    { "type": "text", "text": user_text },
                     { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64) } }
                 ]})
             } else {
-                json!({ "role": "user", "content": build_prompt(&proxy_req) })
+                json!({ "role": "user", "content": user_text })
             };
             messages.push(user_msg);
 
+            let max_tok = req.max_tokens.unwrap_or(4096);
             let body = json!({
                 "model":      model,
                 "messages":   messages,
-                "max_tokens": 4096,
-                "stream":     false
+                "max_tokens": max_tok
+                // "stream" is intentionally omitted — some LM Studio versions
+                // return 400 when stream:false is present in the body.
+                // Omitting it defaults to non-streaming on all compatible servers.
             });
 
             let mut builder = client.post(&url).json(&body);
@@ -550,20 +590,31 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
             })?;
 
             let status = resp.status();
-            let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+            // Read as text first so we get the raw body even if it's not valid JSON
+            let body_text = resp.text().await.map_err(|e| e.to_string())?;
 
             if !status.is_success() {
-                return Err(format!(
-                    "Local LLM {}: {}",
-                    status,
-                    json["error"]["message"].as_str().unwrap_or("unknown error")
-                ));
+                // Try to extract a human-readable message from various server formats
+                let detail = serde_json::from_str::<Value>(&body_text).ok()
+                    .and_then(|j| {
+                        // OpenAI-compat: { error: { message: "..." } }
+                        // LM Studio alt:  { message: "..." }
+                        // FastAPI/Uvicorn: { detail: "..." }
+                        j["error"]["message"].as_str()
+                            .or_else(|| j["message"].as_str())
+                            .or_else(|| j["detail"].as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| body_text.chars().take(300).collect());
+                return Err(format!("Local LLM {}: {}", status, detail));
             }
 
+            let json: Value = serde_json::from_str(&body_text)
+                .map_err(|e| format!("Failed to parse response JSON: {}\nRaw: {}", e, &body_text.chars().take(200).collect::<String>()))?;
+
             Ok(AiResponse {
-                text: json["choices"][0]["message"]["content"]
-                    .as_str().unwrap_or("").to_string(),
-                model: json["model"].as_str().unwrap_or(model).to_string(),
+                text:        extract_content(&json),
+                model:       json["model"].as_str().unwrap_or(model).to_string(),
                 tokens_used: json["usage"]["total_tokens"].as_u64().map(|n| n as u32),
             })
         } => result,

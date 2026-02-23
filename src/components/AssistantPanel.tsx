@@ -23,6 +23,8 @@ export default function AssistantPanel() {
     windowMode, setWindowMode,
     responseLanguage, setResponseLanguage,
     activeCharacterId,
+    fontSize, setFontSize,
+    maxTokens, setMaxTokens,
   } = useAssistantStore();
 
   const scrollRef      = useRef<HTMLDivElement>(null);
@@ -316,6 +318,64 @@ export default function AssistantPanel() {
             <ApiKeyInput />
             <FileIndexer />
             <WebSearchToggle />
+
+            {/* ── Font-size control ── */}
+            <div className="flex items-center justify-between px-3 py-2
+              bg-white/5 rounded-xl">
+              <span className="text-xs text-white/50 select-none">Text size</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setFontSize(fontSize - 1)}
+                  disabled={fontSize <= 10}
+                  className="w-6 h-6 rounded bg-white/10 text-white/60 hover:bg-white/20
+                    hover:text-white transition-colors text-sm leading-none disabled:opacity-30"
+                >
+                  −
+                </button>
+                <span className="text-xs text-white/70 font-mono w-7 text-center">
+                  {fontSize}px
+                </span>
+                <button
+                  onClick={() => setFontSize(fontSize + 1)}
+                  disabled={fontSize >= 22}
+                  className="w-6 h-6 rounded bg-white/10 text-white/60 hover:bg-white/20
+                    hover:text-white transition-colors text-sm leading-none disabled:opacity-30"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            {/* ── Max response length ── */}
+            <div className="bg-white/5 rounded-xl px-3 py-2 space-y-1.5">
+              <span className="text-xs text-white/50 select-none block">Max response length</span>
+              <div className="flex flex-wrap gap-1">
+                {([
+                  { label: "Default", value: null },
+                  { label: "~256",    value: 256  },
+                  { label: "~512",    value: 512  },
+                  { label: "~1 k",    value: 1024 },
+                  { label: "~2 k",    value: 2048 },
+                  { label: "~4 k",    value: 4096 },
+                ] as { label: string; value: number | null }[]).map(({ label, value }) => (
+                  <button
+                    key={String(value)}
+                    onClick={() => setMaxTokens(value)}
+                    className={[
+                      "text-[10px] px-2 py-0.5 rounded font-mono transition-colors",
+                      maxTokens === value
+                        ? "bg-sky-500/40 text-sky-200"
+                        : "bg-white/10 text-white/50 hover:bg-white/20 hover:text-white",
+                    ].join(" ")}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[9px] text-white/25 leading-tight">
+                Tokens ≈ words×¾. If the reply is cut short it will be trimmed to the last full sentence.
+              </p>
+            </div>
           </div>
         )}
 
@@ -362,8 +422,9 @@ export default function AssistantPanel() {
           {messages.map((msg) => (
             <div
               key={msg.id}
+              style={{ fontSize }}
               className={[
-                "rounded-xl px-3 py-2.5 text-sm",
+                "rounded-xl px-3 py-2.5",
                 msg.role === "user"
                   ? "bg-blue-600/25 border border-blue-500/20 ml-4"
                   : "bg-white/[0.04] border border-white/[0.06]",
@@ -470,7 +531,8 @@ export default function AssistantPanel() {
             onPaste={handlePaste}
             placeholder="Ask… (Ctrl+Enter · Ctrl+V image)"
             rows={3}
-            className="w-full bg-white/[0.06] rounded-xl px-3 py-2 text-sm resize-none
+            style={{ fontSize }}
+            className="w-full bg-white/[0.06] rounded-xl px-3 py-2 resize-none
               text-white/85 placeholder-white/20
               focus:outline-none focus:ring-1 focus:ring-white/20
               transition-colors"

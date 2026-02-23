@@ -9,6 +9,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAssistantStore, parseFileEdits, type FileEdit } from "../store/assistantStore";
+import StFormatText from "./StFormatText";
 
 interface Props {
   text: string;
@@ -63,6 +64,146 @@ function langFromPath(p: string): string {
     sh: "bash", md: "markdown",
   };
   return map[ext] ?? ext;
+}
+
+// ── Roleplay renderer ────────────────────────────────────────────────────
+
+/** True when text looks like SillyTavern / chub.ai roleplay output. */
+function isRoleplay(text: string): boolean {
+  return /<START>|\{\{char\}\}|\{\{user\}\}/.test(text);
+}
+
+/**
+ * RoleplayBlock — renders SillyTavern-style roleplay exchanges.
+ *
+ * Handles:
+ *   <START>          → visual scene divider
+ *   {{char}}         → replaced with the active character name
+ *   {{user}}         → replaced with "Вы" (or custom name)
+ *   Speaker: …       → labelled speech / action block
+ *   bare lines       → narrator / continuation text
+ */
+function RoleplayBlock({ raw }: { raw: string }) {
+  const { characters, activeCharacterId } = useAssistantStore();
+  const activeChar = characters.find((c) => c.id === activeCharacterId);
+  const charName = activeChar?.name ?? "char";
+  const userName = "Вы";
+
+  // 1. Substitute template variables
+  const text = raw
+    .replace(/\{\{char\}\}/gi, charName)
+    .replace(/\{\{user\}\}/gi, userName);
+
+  // 2. Split on <START> — each segment is one scene / exchange block
+  const scenes = text.split(/<START>\s*/);
+
+  return (
+    <div className="space-y-3">
+      {scenes.map((scene, si) => {
+        // The very first segment before the first <START> is usually empty or a preamble
+        const isFirstEmpty = si === 0 && scene.trim() === "";
+        return (
+          <div key={si}>
+            {/* Scene divider (not before the very first, non-empty scene) */}
+            {(si > 0 || !isFirstEmpty) && si > 0 && (
+              <div className="flex items-center gap-2 my-2">
+                <div className="flex-1 h-px bg-white/10" />
+                <span className="text-[9px] font-mono text-white/25 tracking-widest uppercase">start</span>
+                <div className="flex-1 h-px bg-white/10" />
+              </div>
+            )}
+            {!isFirstEmpty && (
+              <div className="space-y-1.5">
+                {parseRoleplayLines(scene).map((line, li) => (
+                  <RoleplayLine key={li} line={line} charName={charName} userName={userName} />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+type RoleplayLineData =
+  | { kind: "turn"; speaker: string; content: string }
+  | { kind: "narration"; content: string }
+  | { kind: "blank" };
+
+// Speaker regex: a name (letters, spaces, digits, hyphens) followed by ': '
+// Avoids matching URLs (http:// etc.) by requiring non-slash after colon.
+const SPEAKER_RE = /^([A-Za-zА-Яа-яёЁ0-9][^:\n*"(]{0,50}):\s*([^/].*)$/s;
+
+function parseRoleplayLines(text: string): RoleplayLineData[] {
+  const lines = text.split("\n");
+  const result: RoleplayLineData[] = [];
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line.trim()) {
+      result.push({ kind: "blank" });
+      continue;
+    }
+    const m = line.match(SPEAKER_RE);
+    if (m) {
+      result.push({ kind: "turn", speaker: m[1].trim(), content: m[2].trim() });
+    } else {
+      result.push({ kind: "narration", content: line.trim() });
+    }
+  }
+
+  // Collapse consecutive blanks into one
+  return result.filter((l, i) =>
+    l.kind !== "blank" || (i > 0 && result[i - 1].kind !== "blank")
+  );
+}
+
+function RoleplayLine({
+  line,
+  charName,
+  userName,
+}: {
+  line: RoleplayLineData;
+  charName: string;
+  userName: string;
+}) {
+  if (line.kind === "blank") return <div className="h-1" />;
+
+  if (line.kind === "narration") {
+    return (
+      <p className="text-purple-300/60 italic leading-relaxed whitespace-pre-wrap break-words">
+        <StFormatText text={line.content} />
+      </p>
+    );
+  }
+
+  // Turn
+  const isChar = line.speaker === charName;
+  const isUser = line.speaker === userName || line.speaker.toLowerCase() === "you";
+
+  return (
+    <div
+      className={[
+        "rounded-lg px-2.5 py-1.5 leading-relaxed",
+        isUser
+          ? "bg-blue-600/10 border border-blue-500/15"
+          : isChar
+          ? "bg-pink-900/15 border border-pink-500/15"
+          : "bg-white/[0.03] border border-white/[0.06]",
+      ].join(" ")}
+    >
+      <span
+        className={[
+          "text-[10px] font-semibold tracking-wide mr-1.5 select-none",
+          isUser ? "text-blue-400/70" : isChar ? "text-pink-400/80" : "text-white/40",
+        ].join(" ")}
+      >
+        {line.speaker}:
+      </span>
+      <StFormatText text={line.content} className="whitespace-pre-wrap break-words" />
+    </div>
+  );
 }
 
 // ── Delete card ───────────────────────────────────────────────────────────
@@ -167,7 +308,12 @@ export default function FileEditBlock({ text }: Props) {
   const hasDeleteMarker = /<<<DELETE_FILE:[^\n>]+>>>/.test(text);
   const fileEdits = parseFileEdits(text);
 
-  // If no file edits or delete markers — render plain Markdown (fast path)
+  // Fast path: roleplay text (no file markers)
+  if (fileEdits.length === 0 && !hasDeleteMarker && isRoleplay(text)) {
+    return <RoleplayBlock raw={text} />;
+  }
+
+  // Fast path: plain markdown (no file markers, no roleplay)
   if (fileEdits.length === 0 && !hasDeleteMarker) {
     return (
       <div className="prose prose-invert prose-sm max-w-none">
@@ -197,20 +343,24 @@ export default function FileEditBlock({ text }: Props) {
         seg.kind === "prose" ? (
           seg.text.trim() ? (
             <div key={i} className="prose prose-invert prose-sm max-w-none">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  em: ({ children }) => (
-                    <em className="not-italic text-purple-300/75">
-                      <span className="opacity-40 select-none">*</span>
-                      {children}
-                      <span className="opacity-40 select-none">*</span>
-                    </em>
-                  ),
-                }}
-              >
-                {seg.text}
-              </ReactMarkdown>
+              {isRoleplay(seg.text) ? (
+                <RoleplayBlock raw={seg.text} />
+              ) : (
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    em: ({ children }) => (
+                      <em className="not-italic text-purple-300/75">
+                        <span className="opacity-40 select-none">*</span>
+                        {children}
+                        <span className="opacity-40 select-none">*</span>
+                      </em>
+                    ),
+                  }}
+                >
+                  {seg.text}
+                </ReactMarkdown>
+              )}
             </div>
           ) : null
         ) : seg.kind === "delete" ? (

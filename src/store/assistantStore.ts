@@ -331,6 +331,55 @@ interface AssistantState {
   /** "auto" = follow user's language; otherwise force a specific language */
   responseLanguage: string;
   setResponseLanguage: (lang: string) => void;
+
+  // ── UI preferences ───────────────────────────────────────────────────────
+  /** Chat text size in px (10–22). Default 14. */
+  fontSize: number;
+  setFontSize: (n: number) => void;
+  /** Max output tokens sent to the AI (null = provider default ~2048). */
+  maxTokens: number | null;
+  setMaxTokens: (n: number | null) => void;
+}
+
+// ── Sentence-boundary trimmer ─────────────────────────────────────────────
+/**
+ * When a max-token limit is active and the AI response appears to have been
+ * cut short, trim back to the last complete sentence so the text does not
+ * end mid-word. Appends a note when truncation is detected.
+ */
+function trimToSentenceBoundary(text: string, maxTokens: number | null): string {
+  if (!maxTokens || !text) return text;
+
+  // Heuristic: 1 token ≈ 4 chars.  If the text is clearly shorter than the
+  // limit it was not truncated — return as-is.
+  const charLimit = maxTokens * 4;
+  if (text.length < charLimit * 0.85) return text;
+
+  // Check whether the response already ends cleanly.
+  // A "clean" ending is any sentence-terminating punctuation optionally
+  // followed by closing fences / quotes / whitespace.
+  if (/[.!?。！？]["'`»\)\]]*\s*$/.test(text)) return text;
+  // Also accept responses that end with a closing code fence
+  if (/```\s*$/.test(text)) return text;
+
+  // Find the last sentence boundary (. ! ? followed by whitespace or newline)
+  const sentenceEnd = Math.max(
+    text.lastIndexOf('. '),
+    text.lastIndexOf('.\n'),
+    text.lastIndexOf('! '),
+    text.lastIndexOf('!\n'),
+    text.lastIndexOf('? '),
+    text.lastIndexOf('?\n'),
+  );
+
+  if (sentenceEnd > text.length * 0.4) {
+    // +1 to keep the punctuation character itself
+    return text.slice(0, sentenceEnd + 1).trimEnd()
+      + '\n\n*— ответ обрезан по лимиту токенов —*';
+  }
+
+  // Couldn't find a good boundary — return as-is (better than losing content)
+  return text;
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -355,6 +404,12 @@ export const useAssistantStore = create<AssistantState>()(
         // when both JS keydown and Rust global shortcut fire simultaneously
         invoke("set_ghost_mode", { value: next }).catch(console.error);
       },
+      // ── UI preferences ──────────────────────────────────────────────
+      fontSize: 14,
+      setFontSize: (n) => set({ fontSize: Math.max(10, Math.min(22, n)) }),
+      maxTokens: null,
+      setMaxTokens: (n) => set({ maxTokens: n }),
+
       // ── Window mode ────────────────────────────────────────────────
       windowMode: "overlay",
       setWindowMode: (mode) => {
@@ -405,7 +460,7 @@ export const useAssistantStore = create<AssistantState>()(
       sendMessage: async () => {
         const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages,
                 webSearchEnabled, searchBackend, searchApiKey, searxngUrl,
-                characters, activeCharacterId, responseLanguage } = get();
+                characters, activeCharacterId, responseLanguage, maxTokens } = get();
 
         if (!prompt.trim() && !capturedImage) return;
 
@@ -501,14 +556,18 @@ export const useAssistantStore = create<AssistantState>()(
             }
           }
 
+          const langSuffix = responseLanguage !== "auto"
+            ? `\n[Отвечай исключительно на ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}]`
+            : "";
+
           const fullPrompt = historyBlock
-            ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}${webSearchContext}`
-            : `${currentText}${webSearchContext}`;
+            ? `[Conversation history]\n${historyBlock}[Current message]\nUser: ${currentText}${webSearchContext}${langSuffix}`
+            : `${currentText}${webSearchContext}${langSuffix}`;
 
           // ── Build character system prompt (sent as a real system message) ──
           const activeChar = activeCharacterId ? characters.find((c) => c.id === activeCharacterId) : null;
           const langPrefix = responseLanguage !== "auto"
-            ? `[IMPORTANT: You must ALWAYS respond exclusively in ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}. Do not switch to any other language regardless of the language the user writes in.]\n\n`
+            ? `[SYSTEM LANGUAGE OVERRIDE — HIGHEST PRIORITY RULE: You MUST respond EXCLUSIVELY in ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}. This rule overrides EVERYTHING, including: the language of previous messages in conversation history, the language the user wrote in, any language patterns you observe in the dialogue. Every single word of your response — dialogue, narration, actions, thoughts, descriptions, inner monologue — must be in ${LANGUAGE_NAMES[responseLanguage] ?? responseLanguage}. DO NOT write even a single word in any other language. This applies to your CURRENT response and ALL future responses in this conversation.]\n\n`
             : "";
           const charSystemPrompt: string | null = activeChar
             ? langPrefix + [
@@ -539,6 +598,7 @@ export const useAssistantStore = create<AssistantState>()(
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
+                max_tokens:    maxTokens ?? null,
               }
             : {
                 api_key:       apiKey,
@@ -547,6 +607,7 @@ export const useAssistantStore = create<AssistantState>()(
                 image_base64:  capturedImage ?? null,
                 context_files: contextFiles.length ? contextFiles : null,
                 model,
+                max_tokens:    maxTokens ?? null,
               };
 
           const result = await Promise.race([
@@ -559,7 +620,7 @@ export const useAssistantStore = create<AssistantState>()(
           const assistantMsg: ChatMessage = {
             id:        crypto.randomUUID(),
             role:      "assistant",
-            text:      result.text,
+            text:      trimToSentenceBoundary(result.text, maxTokens),
             timestamp: Date.now(),
           };
           set((s) => ({ messages: [...s.messages, assistantMsg], capturedImage: null }));
@@ -716,7 +777,7 @@ export const useAssistantStore = create<AssistantState>()(
       setActiveCharacter: (id) => set({ activeCharacterId: id }),
 
       // ── Response language ───────────────────────────────────────────
-      responseLanguage:    "auto",
+      responseLanguage:    "ru",
       setResponseLanguage: (lang) => set({ responseLanguage: lang }),
 
       // ── File editing ───────────────────────────────────────────────
@@ -770,11 +831,10 @@ export const useAssistantStore = create<AssistantState>()(
       },
     }),
     {
-      // v2: strips imageBase64 from messages and avatarBase64 from characters
-      // to prevent QuotaExceededError. Old v1 key is auto-migrated below.
+      // v3: default response language changed from "auto" to "ru"
       name:    "ai-assistant-v2",
       storage: safeStorage,
-      version: 2,
+      version: 3,
       migrate: (persisted: unknown, fromVersion: number) => {
         // Carry over settings from v1 / unknown versions, drop heavy blobs
         const old = (persisted ?? {}) as Record<string, unknown>;
@@ -783,7 +843,16 @@ export const useAssistantStore = create<AssistantState>()(
           const chars = (old.characters as Array<Record<string, unknown>> ?? []).map(
             ({ avatarBase64: _, ...c }) => c
           );
-          return { ...old, characters: chars, messages: [], archivedChats: [] };
+          // Fix the old wrong LM Studio URL that was previously the default
+          const localUrl = old.localUrl === "http://127.0.0.1:1234/api/v1/chat"
+            ? "http://127.0.0.1:1234/v1/chat/completions"
+            : old.localUrl;
+          return { ...old, localUrl, characters: chars, messages: [], archivedChats: [] };
+        }
+        if (fromVersion < 3) {
+          // v3: force Russian as the default language if user still had "auto"
+          const responseLanguage = old.responseLanguage === "auto" ? "ru" : old.responseLanguage;
+          return { ...old, responseLanguage };
         }
         return old;
       },
@@ -809,6 +878,8 @@ export const useAssistantStore = create<AssistantState>()(
           activeCharacterId: s.activeCharacterId,
           responseLanguage:  s.responseLanguage,
           windowMode:        s.windowMode,
+          fontSize:          s.fontSize,
+          maxTokens:         s.maxTokens,
           // Keep only the 50 most recent messages (no images)
           messages:          stripImages(s.messages.slice(-50)),
           activeSessionId:   s.activeSessionId,
