@@ -1,4 +1,5 @@
-// ai_bridge.rs — HTTP clients for OpenAI Vision, Anthropic Claude, and local LLMs
+// ai_bridge.rs — HTTP clients for OpenAI Vision, Anthropic Claude, local LLMs + streaming
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -620,4 +621,270 @@ pub async fn analyze_with_local(req: LocalAiRequest) -> Result<AiResponse, Strin
         } => result,
         _ = cancel_rx.changed() => Err("__CANCELLED__".into()),
     }
+}
+// ═══════════════════════════════════════════════════════════════════════
+// Universal SSE streaming
+// Emits: "ai-stream-token" (delta string) and "ai-stream-done" ({text, model})
+// ═══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamRequest {
+    pub provider:      String,
+    pub api_key:       String,
+    pub prompt:        String,
+    pub system_prompt: Option<String>,
+    pub image_base64:  Option<String>,
+    pub context_files: Option<Vec<String>>,
+    pub model:         Option<String>,
+    pub max_tokens:    Option<u32>,
+    pub local_url:     Option<String>,
+}
+
+#[tauri::command]
+pub async fn analyze_stream(window: tauri::Window, req: StreamRequest) -> Result<(), String> {
+    let mut cancel_rx = new_cancel_receiver();
+    tokio::select! {
+        result = stream_inner(window.clone(), req) => result,
+        _ = cancel_rx.changed() => {
+            let _ = window.emit("ai-stream-done", serde_json::json!({ "cancelled": true }));
+            Err("__CANCELLED__".into())
+        },
+    }
+}
+
+async fn stream_inner(window: tauri::Window, req: StreamRequest) -> Result<(), String> {
+    match req.provider.as_str() {
+        "claude" => stream_claude(window, req).await,
+        _        => stream_openai_compat(window, req).await,
+    }
+}
+
+async fn stream_openai_compat(window: tauri::Window, req: StreamRequest) -> Result<(), String> {
+    let client = http_client().map_err(|e| e.to_string())?;
+
+    let (url, bearer) = match req.provider.as_str() {
+        "openai"     => {
+            if req.api_key.is_empty() { return Err("OpenAI API key required".into()); }
+            ("https://api.openai.com/v1/chat/completions".to_string(), req.api_key.clone())
+        }
+        "deepseek"   => {
+            if req.api_key.is_empty() { return Err("DeepSeek API key required".into()); }
+            ("https://api.deepseek.com/v1/chat/completions".to_string(), req.api_key.clone())
+        }
+        "openrouter" => {
+            if req.api_key.is_empty() { return Err("OpenRouter API key required".into()); }
+            ("https://openrouter.ai/api/v1/chat/completions".to_string(), req.api_key.clone())
+        }
+        "local" => {
+            let base = req.local_url.as_deref().unwrap_or("http://127.0.0.1:1234").trim_end_matches('/');
+            let has_path = base.split("://").nth(1).map(|s| s.contains('/')).unwrap_or(false);
+            let url = if has_path { base.to_string() } else { format!("{}/v1/chat/completions", base) };
+            (url, req.api_key.clone())
+        }
+        other => return Err(format!("Unknown provider for streaming: {}", other)),
+    };
+
+    let model = req.model.as_deref().unwrap_or(match req.provider.as_str() {
+        "deepseek"   => "deepseek-chat",
+        "openrouter" => "openai/gpt-4o",
+        "local"      => "local-model",
+        _            => "gpt-4o",
+    }).to_string();
+
+    let ai_req = AiRequest {
+        api_key: req.api_key.clone(), prompt: req.prompt.clone(),
+        system_prompt: req.system_prompt.clone(), image_base64: req.image_base64.clone(),
+        context_files: req.context_files.clone(), model: req.model.clone(), max_tokens: req.max_tokens,
+    };
+    let prompt_text = build_prompt(&ai_req);
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    // For cloud providers, use a proper system message
+    if req.provider != "local" {
+        if let Some(sys) = &req.system_prompt {
+            if !sys.trim().is_empty() {
+                messages.push(json!({ "role": "system", "content": sys }));
+            }
+        }
+    }
+
+    // For local, prepend system to user message (many local servers reject "system" role)
+    let full_user_text = if req.provider == "local" {
+        if let Some(sys) = &req.system_prompt {
+            let s = sys.trim();
+            if !s.is_empty() { format!("{}\n\n{}", s, prompt_text) } else { prompt_text }
+        } else { prompt_text }
+    } else { prompt_text };
+
+    let user_msg = if let Some(b64) = &req.image_base64 {
+        json!({ "role": "user", "content": [
+            { "type": "text",      "text": full_user_text },
+            { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64) } }
+        ]})
+    } else {
+        json!({ "role": "user", "content": full_user_text })
+    };
+    messages.push(user_msg);
+
+    let max_tok = req.max_tokens.unwrap_or(4096);
+    let body = json!({
+        "model": model, "messages": messages,
+        "max_tokens": max_tok, "stream": true
+    });
+
+    let mut builder = client.post(&url).json(&body);
+    if !bearer.is_empty() { builder = builder.bearer_auth(&bearer); }
+    if req.provider == "openrouter" {
+        builder = builder
+            .header("HTTP-Referer", "https://github.com/ai-assistant")
+            .header("X-Title", "AI Assistant Overlay");
+    }
+
+    let resp = builder.send().await.map_err(|e| format!("Stream failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let err_json: Value = resp.json().await.unwrap_or(json!({}));
+        return Err(format!("{} {}: {}", req.provider, status,
+            err_json["error"]["message"].as_str().unwrap_or("unknown")));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut full_text = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Stream read: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf = buf[pos + 1..].to_string();
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" { break; }
+                if let Ok(j) = serde_json::from_str::<Value>(data) {
+                    let delta = j["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                    if !delta.is_empty() {
+                        full_text.push_str(delta);
+                        let _ = window.emit("ai-stream-token", delta);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = window.emit("ai-stream-done", serde_json::json!({ "text": full_text, "model": model }));
+    Ok(())
+}
+
+async fn stream_claude(window: tauri::Window, req: StreamRequest) -> Result<(), String> {
+    if req.api_key.is_empty() { return Err("Anthropic API key required".into()); }
+    let client = http_client().map_err(|e| e.to_string())?;
+    let model = req.model.as_deref().unwrap_or("claude-3-5-sonnet-20241022").to_string();
+
+    let ai_req = AiRequest {
+        api_key: req.api_key.clone(), prompt: req.prompt.clone(),
+        system_prompt: req.system_prompt.clone(), image_base64: req.image_base64.clone(),
+        context_files: req.context_files.clone(), model: req.model.clone(), max_tokens: req.max_tokens,
+    };
+
+    let mut content: Vec<Value> = Vec::new();
+    if let Some(b64) = &req.image_base64 {
+        content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": b64 } }));
+    }
+    content.push(json!({ "type": "text", "text": build_prompt(&ai_req) }));
+
+    let sys = req.system_prompt.as_deref().unwrap_or("").trim();
+    let max_tok = req.max_tokens.unwrap_or(4096);
+    let mut body = json!({
+        "model": model, "max_tokens": max_tok, "stream": true,
+        "messages": [{ "role": "user", "content": content }]
+    });
+    if !sys.is_empty() { body["system"] = json!(sys); }
+
+    let resp = client.post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &req.api_key).header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json").json(&body)
+        .send().await.map_err(|e| format!("Stream failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_json: Value = resp.json().await.unwrap_or(json!({}));
+        return Err(format!("Claude {}: {}", status,
+            err_json["error"]["message"].as_str().unwrap_or("unknown")));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut full_text = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Stream read: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf = buf[pos + 1..].to_string();
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(j) = serde_json::from_str::<Value>(data) {
+                    if j["type"] == "content_block_delta" {
+                        let delta = j["delta"]["text"].as_str().unwrap_or("");
+                        if !delta.is_empty() {
+                            full_text.push_str(delta);
+                            let _ = window.emit("ai-stream-token", delta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = window.emit("ai-stream-done", serde_json::json!({ "text": full_text, "model": model }));
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Ollama / LM Studio — list local models + SD models
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tauri::command]
+pub async fn list_ollama_models(base_url: Option<String>) -> Result<Vec<String>, String> {
+    let base = base_url.as_deref().unwrap_or("http://127.0.0.1:11434").trim_end_matches('/');
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client.get(format!("{}/api/tags", base))
+        .timeout(std::time::Duration::from_secs(4)).send().await
+        .map_err(|e| format!("Ollama not reachable at {}: {}", base, e))?;
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(json["models"].as_array().unwrap_or(&vec![])
+        .iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
+}
+
+#[tauri::command]
+pub async fn list_lmstudio_models(base_url: Option<String>) -> Result<Vec<String>, String> {
+    let base = base_url.as_deref().unwrap_or("http://127.0.0.1:1234").trim_end_matches('/');
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client.get(format!("{}/v1/models", base))
+        .timeout(std::time::Duration::from_secs(4)).send().await
+        .map_err(|e| format!("LM Studio not reachable at {}: {}", base, e))?;
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(json["data"].as_array().unwrap_or(&vec![])
+        .iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SdModel {
+    pub title:      String,
+    pub model_name: String,
+}
+
+#[tauri::command]
+pub async fn list_sd_models(base_url: Option<String>) -> Result<Vec<SdModel>, String> {
+    let base = base_url.as_deref().unwrap_or("http://127.0.0.1:7860").trim_end_matches('/');
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client.get(format!("{}/sdapi/v1/sd-models", base))
+        .timeout(std::time::Duration::from_secs(8)).send().await
+        .map_err(|e| format!("SD WebUI not reachable at {}: {}", base, e))?;
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(json.as_array().unwrap_or(&vec![]).iter().map(|m| SdModel {
+        title:      m["title"].as_str().unwrap_or("").to_string(),
+        model_name: m["model_name"].as_str().unwrap_or("").to_string(),
+    }).collect())
 }

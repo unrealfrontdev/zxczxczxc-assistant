@@ -9,7 +9,12 @@ import WebSearchToggle from "./WebSearchToggle";
 import PromptLibrary from "./PromptLibrary";
 import CharacterImport from "./CharacterImport";
 import ChatHistory from "./ChatHistory";
+import ImageGenSettings from "./ImageGenSettings";
 import StFormatText, { ST_FORMAT_EXAMPLES } from "./StFormatText";
+import FileTree from "./FileTree";
+import ImageGallery from "./ImageGallery";
+
+type Tab = "chat" | "files" | "images";
 
 const PANEL_WIDTH = 420;
 
@@ -25,7 +30,13 @@ export default function AssistantPanel() {
     activeCharacterId,
     fontSize, setFontSize,
     maxTokens, setMaxTokens,
+    isGeneratingImage, lastGeneratedImage, clearGeneratedImage, generateImage,
+    isStreaming, streamingText,
+    imageGenCustomPrompt,
+    sdGenProgress,
   } = useAssistantStore();
+
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
 
   const scrollRef      = useRef<HTMLDivElement>(null);
   const [confirmClear,  setConfirmClear]  = useState(false);
@@ -308,6 +319,28 @@ export default function AssistantPanel() {
           </div>
         </header>
 
+        {/* ── Tab bar ──────────────────────────────────────────────────── */}
+        <div className="shrink-0 flex border-b border-white/[0.07]">
+          {(["chat", "files", "images"] as Tab[]).map((tab) => {
+            const icons: Record<Tab, string> = { chat: "💬", files: "📁", images: "🎨" };
+            const labels: Record<Tab, string> = { chat: "Chat", files: "Files", images: "Images" };
+            return (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={[
+                  "flex-1 text-[10px] py-1.5 font-medium transition-colors border-b-2",
+                  activeTab === tab
+                    ? "border-blue-400 text-white/90 bg-white/[0.04]"
+                    : "border-transparent text-white/35 hover:text-white/60 hover:bg-white/[0.03]",
+                ].join(" ")}
+              >
+                {icons[tab]} {labels[tab]}
+              </button>
+            );
+          })}
+        </div>
+
         {/* ── Chat history panel ────────────────────────────────────────── */}
         {historyOpen && <ChatHistory onClose={() => setHistoryOpen(false)} />}
 
@@ -318,6 +351,7 @@ export default function AssistantPanel() {
             <ApiKeyInput />
             <FileIndexer />
             <WebSearchToggle />
+            <ImageGenSettings />
 
             {/* ── Font-size control ── */}
             <div className="flex items-center justify-between px-3 py-2
@@ -393,7 +427,8 @@ export default function AssistantPanel() {
           </div>
         )}
 
-        {/* ── Message thread ────────────────────────────────────────────── */}
+        {/* ── Message thread  (chat tab) ─────────────────────────────── */}
+        {activeTab === "chat" && (
         <div
           ref={scrollRef}
           className="flex-1 overflow-y-auto px-3 py-3 space-y-3
@@ -450,13 +485,39 @@ export default function AssistantPanel() {
             </div>
           ))}
 
-          {isLoading && (
-            <div className="flex items-center gap-2 text-xs text-white/30">
-              <span className="animate-spin">⚙️</span>
-              <span>Thinking…</span>
+          {(isLoading || isStreaming) && (
+            <div className="flex items-start gap-2">
+              <div className="flex-1 rounded-xl px-3 py-2.5 bg-white/[0.04] border border-white/[0.06]">
+                {isStreaming && streamingText ? (
+                  <p className="whitespace-pre-wrap break-words text-white/85" style={{ fontSize }}>
+                    {streamingText}
+                    <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-white/60 animate-pulse rounded-sm align-middle" />
+                  </p>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-white/30">
+                    <span className="animate-spin">⚙️</span>
+                    <span>Thinking…</span>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
+        )} {/* end chat tab */}
+
+        {/* ── Files tab ────────────────────────────────────────────────── */}
+        {activeTab === "files" && (
+          <div className="flex-1 overflow-hidden">
+            <FileTree className="h-full" />
+          </div>
+        )}
+
+        {/* ── Images tab ───────────────────────────────────────────────── */}
+        {activeTab === "images" && (
+          <div className="flex-1 overflow-hidden">
+            <ImageGallery className="h-full" />
+          </div>
+        )}
 
         {/* ── Screenshot preview ────────────────────────────────────────── */}
         {capturedImage && (
@@ -465,7 +526,63 @@ export default function AssistantPanel() {
           </div>
         )}
 
-        {/* ── Input area ───────────────────────────────────────────────── */}
+        {/* ── SD / Image generation progress ──────────────────────────── */}
+        {isGeneratingImage && (
+          <div className="shrink-0 mx-3 mb-1 rounded-xl border border-emerald-500/25 bg-emerald-900/20 p-2 space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="animate-spin text-[11px]">⚙️</span>
+              <span className="text-[10px] text-emerald-300/80 font-medium flex-1">
+                {sdGenProgress ? "Generating…" : "Preparing…"}
+              </span>
+              {sdGenProgress?.total != null && sdGenProgress.total > 0 && (
+                <span className="text-[9px] text-white/50 font-mono shrink-0">
+                  {sdGenProgress.step}/{sdGenProgress.total} steps
+                </span>
+              )}
+            </div>
+            {sdGenProgress?.total != null && sdGenProgress.total > 0 ? (
+              <>
+                <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-emerald-500/70 rounded-full transition-all duration-300"
+                    style={{ width: `${Math.round((sdGenProgress.step / sdGenProgress.total) * 100)}%` }}
+                  />
+                </div>
+                <p className="text-[9px] text-white/30 font-mono truncate">{sdGenProgress.line}</p>
+              </>
+            ) : (
+              <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                <div className="h-full bg-emerald-500/40 rounded-full animate-pulse" style={{ width: "100%" }} />
+              </div>
+            )}
+          </div>
+        )}
+        {/* ── Generated image panel ───────────────────────────────────────── */}
+        {lastGeneratedImage && (
+          <div className="shrink-0 mx-3 mb-1 rounded-xl overflow-hidden
+            border border-emerald-500/20 bg-black/30">
+            <div className="flex items-center justify-between px-2 py-1
+              border-b border-white/[0.06]">
+              <span className="text-[9px] text-emerald-400/70 font-mono truncate flex-1 pr-2">
+                🎨 {lastGeneratedImage.revisedPrompt ?? lastGeneratedImage.prompt}
+              </span>
+              <button
+                onClick={clearGeneratedImage}
+                className="text-[10px] text-white/30 hover:text-red-400 transition-colors ml-1 flex-none"
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <img
+              src={`data:image/${lastGeneratedImage.format};base64,${lastGeneratedImage.base64}`}
+              alt="AI generated"
+              className="w-full object-contain max-h-72"
+            />
+          </div>
+        )}
+        {/* ── Input area (chat tab only) ────────────────────────────────── */}
+        {activeTab === "chat" && (
         <div className="shrink-0 border-t border-white/[0.07] p-3 space-y-2">
           {capturedImage && (
             <div className="flex items-center justify-between text-[10px]">
@@ -508,7 +625,7 @@ export default function AssistantPanel() {
                         ta.setSelectionRange(s + insert.length, s + insert.length);
                       }, 0);
                     } else {
-                      setPrompt((p) => p + ins);
+                      setPrompt(prompt + ins);
                     }
                   }}
                   className={[
@@ -562,21 +679,39 @@ export default function AssistantPanel() {
               📋
             </button>
 
+            {/* Generate image */}
+            <button
+              onClick={generateImage}
+              disabled={isGeneratingImage || (messages.length === 0 && !imageGenCustomPrompt.trim())}
+              title="Generate an image from the current chat context or custom prompt"
+              className={[
+                "flex-none flex items-center justify-center gap-1",
+                "rounded-xl px-3 py-2 text-[11px] transition-colors",
+                isGeneratingImage
+                  ? "bg-emerald-600/40 text-emerald-300 animate-pulse"
+                  : "bg-white/[0.06] hover:bg-emerald-500/20 text-white/50"
+                    + " hover:text-emerald-300 disabled:opacity-30 disabled:cursor-not-allowed",
+              ].join(" ")}
+            >
+              {isGeneratingImage ? <span className="animate-spin text-xs">⚙️</span> : "🎨"}
+            </button>
+
             {/* Send / Stop */}
             <button
-              onClick={isLoading ? cancelMessage : sendMessage}
-              disabled={!isLoading && !prompt.trim() && !capturedImage}
+              onClick={isLoading || isStreaming ? cancelMessage : sendMessage}
+              disabled={!isLoading && !isStreaming && !prompt.trim() && !capturedImage}
               className={[
                 "flex-1 rounded-xl py-2 text-xs font-semibold transition-colors",
-                isLoading
+                (isLoading || isStreaming)
                   ? "bg-red-600/70 hover:bg-red-600 text-white"
                   : "bg-blue-600/70 hover:bg-blue-600 text-white disabled:opacity-30",
               ].join(" ")}
             >
-              {isLoading ? "■ Stop" : "Send  ⌘↩"}
+              {(isLoading || isStreaming) ? "■ Stop" : "Send  ⌘↩"}
             </button>
           </div>
         </div>
+        )} {/* end input area / chat tab */}
       </div>
     </div>
   );

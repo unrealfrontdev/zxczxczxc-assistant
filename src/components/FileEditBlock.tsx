@@ -6,6 +6,7 @@
  * on render — no buttons or confirmation steps.
  */
 import { useEffect, useState } from "react";
+import type { ReactNode, ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAssistantStore, parseFileEdits, type FileEdit } from "../store/assistantStore";
@@ -319,15 +320,16 @@ export default function FileEditBlock({ text }: Props) {
       <div className="prose prose-invert prose-sm max-w-none">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
-          components={{
-            em: ({ children }) => (
+          components={({
+            em: ({ children }: { children: ReactNode }) => (
               <em className="not-italic text-purple-300/75">
                 <span className="opacity-40 select-none">*</span>
                 {children}
                 <span className="opacity-40 select-none">*</span>
               </em>
             ),
-          }}
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          }) as Record<string, ComponentType<any>>}
         >
           {text}
         </ReactMarkdown>
@@ -348,15 +350,16 @@ export default function FileEditBlock({ text }: Props) {
               ) : (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
-                  components={{
-                    em: ({ children }) => (
+                  components={({
+                    em: ({ children }: { children: ReactNode }) => (
                       <em className="not-italic text-purple-300/75">
                         <span className="opacity-40 select-none">*</span>
                         {children}
                         <span className="opacity-40 select-none">*</span>
                       </em>
                     ),
-                  }}
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  }) as Record<string, ComponentType<any>>}
                 >
                   {seg.text}
                 </ReactMarkdown>

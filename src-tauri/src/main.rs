@@ -5,6 +5,8 @@
 
 mod ai_bridge;
 mod clipboard;
+mod image_gen;
+mod local_sd;
 mod overlay;
 mod project_indexer;
 mod screen_capture;
@@ -99,19 +101,33 @@ fn main() {
             screen_capture::capture_window_under_cursor,
             ai_bridge::analyze_with_openai,
             ai_bridge::analyze_with_claude,
+            ai_bridge::analyze_with_deepseek,
+            ai_bridge::analyze_with_openrouter,
+            ai_bridge::analyze_with_local,
+            ai_bridge::cancel_ai_request,
+            ai_bridge::analyze_stream,
+            ai_bridge::list_ollama_models,
+            ai_bridge::list_lmstudio_models,
+            ai_bridge::list_sd_models,
             project_indexer::index_directory,
             project_indexer::read_file_content,
             project_indexer::write_file,
             project_indexer::patch_file,
             project_indexer::delete_file,
-            ai_bridge::analyze_with_deepseek,
-            ai_bridge::analyze_with_openrouter,
-            ai_bridge::analyze_with_local,
-            ai_bridge::cancel_ai_request,
+            project_indexer::list_dir,
+            project_indexer::create_dir_cmd,
+            project_indexer::rename_path,
             web_search::web_search,
             web_search::fetch_url_content,
             web_search::search_and_fetch,
             clipboard::get_clipboard_image,
+            image_gen::generate_image,
+            local_sd::get_sd_binary_status,
+            local_sd::download_sd_binary,
+            local_sd::delete_sd_binary,
+            local_sd::list_local_sd_models,
+            local_sd::check_cuda_libs,
+            local_sd::run_local_sd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

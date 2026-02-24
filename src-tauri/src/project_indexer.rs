@@ -241,6 +241,70 @@ pub async fn patch_file(
     Ok(())
 }
 
+/// List immediate children of a directory (shallow, one level).
+/// Returns entries with name, kind ("file"|"dir"), and size.
+#[tauri::command]
+pub async fn list_dir(dir_path: String) -> Result<Vec<DirEntry>, String> {
+    let path = Path::new(&dir_path);
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("'{}' is not a valid directory", dir_path));
+    }
+
+    let mut entries = Vec::new();
+    let read = std::fs::read_dir(path)
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+    for item in read.flatten() {
+        let name = item.file_name().to_string_lossy().to_string();
+        // Skip hidden files/dirs except .env
+        if name.starts_with('.') && name != ".env" { continue; }
+        let meta = match item.metadata() {
+            Ok(m)  => m,
+            Err(_) => continue,
+        };
+        let kind = if meta.is_dir() { "dir" } else { "file" }.to_string();
+        entries.push(DirEntry {
+            name,
+            kind,
+            size_bytes: meta.len(),
+            path: item.path().to_string_lossy().to_string(),
+        });
+    }
+
+    // Dirs first, then files, both alphabetically
+    entries.sort_by(|a, b| {
+        match (a.kind.as_str(), b.kind.as_str()) {
+            ("dir","file") => std::cmp::Ordering::Less,
+            ("file","dir") => std::cmp::Ordering::Greater,
+            _              => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(entries)
+}
+
+/// Create an empty directory (recursive).
+#[tauri::command]
+pub async fn create_dir_cmd(dir_path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&dir_path)
+        .map_err(|e| format!("Failed to create directory '{}': {}", dir_path, e))
+}
+
+/// Rename or move a file/directory.
+#[tauri::command]
+pub async fn rename_path(from_path: String, to_path: String) -> Result<(), String> {
+    std::fs::rename(&from_path, &to_path)
+        .map_err(|e| format!("Failed to rename '{}' → '{}': {}", from_path, to_path, e))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name:       String,
+    pub kind:       String, // "file" | "dir"
+    pub size_bytes: u64,
+    pub path:       String,
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn is_ignored_dir(path: &Path) -> bool {

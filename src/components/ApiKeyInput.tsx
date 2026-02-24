@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/tauri";
 import { useAssistantStore, AiProvider } from "../store/assistantStore";
 
 const MODELS: Record<AiProvider, string[]> = {
@@ -48,8 +49,10 @@ export default function ApiKeyInput() {
     localUrl, setLocalUrl,
   } = useAssistantStore();
 
-  const [open,    setOpen]    = useState(!apiKey && provider !== "local");
-  const [visible, setVisible] = useState(false);
+  const [open,         setOpen]         = useState(!apiKey && provider !== "local");
+  const [visible,      setVisible]      = useState(false);
+  const [detecting,    setDetecting]    = useState(false);
+  const [detectedModels, setDetectedModels] = useState<string[]>([]);
 
   const isLocal   = provider === "local";
   const hasConfig = isLocal ? !!localUrl : !!apiKey;
@@ -145,6 +148,63 @@ export default function ApiKeyInput() {
                 {"  ·  "}
                 Ollama: <span className="text-purple-300/70">…:11434</span>
               </p>
+
+              {/* Detect models from local server */}
+              <div className="flex gap-1.5 items-center">
+                <button
+                  onClick={async () => {
+                    setDetecting(true);
+                    setDetectedModels([]);
+                    try {
+                      // Try LM Studio endpoint first
+                      const lmUrl = localUrl.includes("/v1/chat/completions")
+                        ? localUrl.replace("/v1/chat/completions", "")
+                        : localUrl;
+                      let models: string[] = [];
+                      try {
+                        models = await invoke<string[]>("list_lmstudio_models", { baseUrl: lmUrl });
+                      } catch {
+                        // Try Ollama
+                        const ollamaBase = localUrl.includes("1234") ? "http://localhost:11434" : localUrl;
+                        models = await invoke<string[]>("list_ollama_models", { baseUrl: ollamaBase });
+                      }
+                      setDetectedModels(models);
+                      if (models.length > 0 && !models.includes(model)) {
+                        setModel(models[0]);
+                      }
+                    } catch (e) {
+                      setDetectedModels([`Error: ${e}`]);
+                    } finally {
+                      setDetecting(false);
+                    }
+                  }}
+                  disabled={detecting}
+                  className="flex-1 py-1 rounded-lg text-[10px] font-medium transition-colors
+                    bg-purple-500/20 hover:bg-purple-500/40 text-purple-300 disabled:opacity-40"
+                >
+                  {detecting ? "Scanning…" : "🔍 Detect models"}
+                </button>
+              </div>
+
+              {/* Detected model list */}
+              {detectedModels.length > 0 && (
+                <div className="bg-white/[0.04] rounded-lg p-1.5 space-y-0.5">
+                  {detectedModels.map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setModel(m)}
+                      className={[
+                        "w-full text-left px-2 py-1 rounded text-[10px] truncate transition-colors",
+                        model === m
+                          ? "bg-purple-500/30 text-purple-200"
+                          : "hover:bg-white/10 text-white/60 hover:text-white",
+                      ].join(" ")}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              )}
 
               {/* Model — free-text or from suggestions */}
               <input

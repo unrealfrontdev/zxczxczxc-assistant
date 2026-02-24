@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { invoke } from "@tauri-apps/api/tauri";
+import { listen } from "@tauri-apps/api/event";
 
 // Module-level cancel hook — not stored in Zustand state (not serialisable)
 let _cancelFn: (() => void) | null = null;
@@ -33,6 +34,16 @@ try { localStorage.removeItem("ai-assistant-v1"); } catch { /* ignore */ }
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export type AiProvider = "openai" | "claude" | "deepseek" | "openrouter" | "local";
+export type ImageGenProvider = "dalle" | "stability" | "together" | "local_sd" | "openrouter" | "native_sd";
+export type NativeSdGpuBackend = "cpu" | "cuda" | "vulkan";
+
+export interface GeneratedImage {
+  base64: string;
+  format: string;
+  prompt: string;
+  revisedPrompt?: string;
+  timestamp: number;
+}
 
 // ── Prompt Library ─────────────────────────────────────────────────────────
 
@@ -270,6 +281,13 @@ interface AssistantState {
   prompt:     string;
   setPrompt:  (p: string) => void;
   isLoading:  boolean;
+  /** True while tokens are streaming via SSE */
+  isStreaming:     boolean;
+  /** Accumulated streaming text (live preview, not yet in messages[]) */
+  streamingText:   string;
+  /** Whether to use SSE streaming (default true; falls back to one-shot on error) */
+  useStreaming:    boolean;
+  setUseStreaming: (v: boolean) => void;
   sendMessage: () => Promise<void>;
   cancelMessage: () => void;
   clearMessages: () => void;
@@ -339,6 +357,76 @@ interface AssistantState {
   /** Max output tokens sent to the AI (null = provider default ~2048). */
   maxTokens: number | null;
   setMaxTokens: (n: number | null) => void;
+
+  // ── Image generation ────────────────────────────────────────────────────
+  imageGenProvider: ImageGenProvider;
+  setImageGenProvider: (p: ImageGenProvider) => void;
+  /** API key for the image generation provider (not needed for local_sd) */
+  imageGenApiKey: string;
+  setImageGenApiKey: (k: string) => void;
+  /** Model override (leave empty to use provider default) */
+  imageGenModel: string;
+  setImageGenModel: (m: string) => void;
+  /** Base URL override – required for local_sd, optional for others */
+  imageGenUrl: string;
+  setImageGenUrl: (url: string) => void;
+  /** Output dimensions */
+  imageGenWidth: number;
+  setImageGenWidth: (n: number) => void;
+  imageGenHeight: number;
+  setImageGenHeight: (n: number) => void;
+  /** Native SD step-by-step progress (null when not running) */
+  sdGenProgress: { line: string; step: number; total: number } | null;
+  /** Is an image currently being generated? */
+  isGeneratingImage: boolean;
+  /** Last successfully generated image, ready to display */
+  lastGeneratedImage: GeneratedImage | null;
+  clearGeneratedImage: () => void;
+  /** Gallery of all generated images (max 50, newest first) */
+  imageGallery: GeneratedImage[];
+  removeGalleryImage: (timestamp: number) => void;
+  clearGallery: () => void;
+  /** Optional prompt override — if set, skips the auto-generation step */
+  imageGenCustomPrompt: string;
+  setImageGenCustomPrompt: (p: string) => void;
+  // ── Native SD (stable-diffusion.cpp) settings ──────────────────
+  nativeSdModelPath: string;
+  setNativeSdModelPath: (p: string) => void;
+  nativeSdModelsDir: string;
+  setNativeSdModelsDir: (d: string) => void;
+  nativeSdSteps: number;
+  setNativeSdSteps: (n: number) => void;
+  nativeSdCfg: number;
+  setNativeSdCfg: (n: number) => void;
+  nativeSdNegPrompt: string;
+  setNativeSdNegPrompt: (p: string) => void;
+  nativeSdSampler: string;
+  setNativeSdSampler: (s: string) => void;
+  nativeSdSeed: number;
+  setNativeSdSeed: (n: number) => void;
+  /** GPU backend for stable-diffusion.cpp: "cpu" | "cuda" | "vulkan" */
+  nativeSdGpuBackend: NativeSdGpuBackend;
+  setNativeSdGpuBackend: (b: NativeSdGpuBackend) => void;
+  /** CPU thread count for stable-diffusion.cpp (0 = auto) */
+  nativeSdThreads: number;
+  setNativeSdThreads: (n: number) => void;
+  /** Prepend quality booster tags (score_9, masterpiece…) to the generated prompt */
+  nativeSdQualityTags: boolean;
+  setNativeSdQualityTags: (v: boolean) => void;
+  /** Include NSFW tags in the generated prompt */
+  nativeSdNsfw: boolean;
+  setNativeSdNsfw: (v: boolean) => void;
+  /** Pass --vae-on-cpu: offloads VAE decode to RAM, prevents VRAM OOM on SDXL */
+  nativeSdVaeOnCpu: boolean;
+  setNativeSdVaeOnCpu: (v: boolean) => void;
+  /** Pass --vae-tiling: tiles the VAE decode to reduce VRAM usage */
+  nativeSdVaeTiling: boolean;
+  setNativeSdVaeTiling: (v: boolean) => void;
+  /** Pass --offload-to-cpu: model weights stored in RAM, loaded to VRAM on demand (prevents OOM on load) */
+  nativeSdOffloadToCpu: boolean;
+  setNativeSdOffloadToCpu: (v: boolean) => void;
+  /** Generate an image that represents the current chat context */
+  generateImage: () => Promise<void>;
 }
 
 // ── Sentence-boundary trimmer ─────────────────────────────────────────────
@@ -410,6 +498,303 @@ export const useAssistantStore = create<AssistantState>()(
       maxTokens: null,
       setMaxTokens: (n) => set({ maxTokens: n }),
 
+      // ── Image generation ────────────────────────────────────────────
+      imageGenProvider: "dalle",
+      setImageGenProvider: (p) => set({ imageGenProvider: p }),
+      imageGenApiKey: "",
+      setImageGenApiKey: (k) => set({ imageGenApiKey: k }),
+      imageGenModel: "",
+      setImageGenModel: (m) => set({ imageGenModel: m }),
+      imageGenUrl: "http://127.0.0.1:7860",
+      setImageGenUrl: (url) => set({ imageGenUrl: url }),
+      imageGenWidth: 512,
+      setImageGenWidth: (n) => set({ imageGenWidth: n }),
+      imageGenHeight: 512,
+      setImageGenHeight: (n) => set({ imageGenHeight: n }),
+      sdGenProgress: null,
+      isGeneratingImage: false,
+      lastGeneratedImage: null,
+      clearGeneratedImage: () => set({ lastGeneratedImage: null }),
+      imageGallery: [],
+      removeGalleryImage: (ts) => set((s) => ({ imageGallery: s.imageGallery.filter((i) => i.timestamp !== ts) })),
+      clearGallery: () => set({ imageGallery: [] }),
+      imageGenCustomPrompt: "",
+      setImageGenCustomPrompt: (p) => set({ imageGenCustomPrompt: p }),
+
+      // ── Native SD state ──────────────────────────────────────────
+      nativeSdModelPath: "",
+      setNativeSdModelPath: (p) => set({ nativeSdModelPath: p }),
+      nativeSdModelsDir: "",
+      setNativeSdModelsDir: (d) => set({ nativeSdModelsDir: d }),
+      nativeSdSteps: 15,
+      setNativeSdSteps: (n) => set({ nativeSdSteps: n }),
+      nativeSdCfg: 7,
+      setNativeSdCfg: (n) => set({ nativeSdCfg: n }),
+      nativeSdNegPrompt: "blurry, low quality, distorted, deformed, watermark",
+      setNativeSdNegPrompt: (p) => set({ nativeSdNegPrompt: p }),
+      nativeSdSampler: "euler_a",
+      setNativeSdSampler: (s) => set({ nativeSdSampler: s }),
+      nativeSdSeed: -1,
+      setNativeSdSeed: (n) => set({ nativeSdSeed: n }),
+      nativeSdGpuBackend: "cpu" as NativeSdGpuBackend,
+      setNativeSdGpuBackend: (b) => set({ nativeSdGpuBackend: b }),
+      nativeSdThreads: 0,
+      setNativeSdThreads: (n) => set({ nativeSdThreads: n }),
+      nativeSdQualityTags: true,
+      setNativeSdQualityTags: (v) => set({ nativeSdQualityTags: v }),
+      nativeSdNsfw: false,
+      setNativeSdNsfw: (v) => set({ nativeSdNsfw: v }),
+      nativeSdVaeOnCpu: false,
+      setNativeSdVaeOnCpu: (v) => set({ nativeSdVaeOnCpu: v }),
+      nativeSdVaeTiling: true,
+      setNativeSdVaeTiling: (v) => set({ nativeSdVaeTiling: v }),
+      nativeSdOffloadToCpu: true,
+      setNativeSdOffloadToCpu: (v) => set({ nativeSdOffloadToCpu: v }),
+
+      generateImage: async () => {
+        const {
+          messages, apiKey, provider, model, localUrl,
+          imageGenProvider, imageGenApiKey, imageGenModel, imageGenUrl,
+          imageGenWidth, imageGenHeight, imageGenCustomPrompt,
+        } = get();
+
+        if (messages.length === 0 && !imageGenCustomPrompt.trim()) {
+          const errMsg: ChatMessage = {
+            id: crypto.randomUUID(), role: "assistant", timestamp: Date.now(),
+            text: "**Image generation:** нет сообщений в чате. Начните разговор или введите свой промпт в настройках генерации.",
+          };
+          set((s) => ({ messages: [...s.messages, errMsg] }));
+          return;
+        }
+
+        set({ isGeneratingImage: true });
+        console.group("%c[IMG] generateImage started", "color:#f59e0b;font-weight:bold");
+        console.log("provider:", imageGenProvider);
+        console.log("customPrompt:", imageGenCustomPrompt || "(none — will use chat context)");
+        console.groupEnd();
+
+        try {
+          let visualPrompt: string;
+
+          if (imageGenCustomPrompt.trim()) {
+            // Use the user-supplied custom prompt as-is
+            visualPrompt = imageGenCustomPrompt.trim();
+          } else {
+          // ── Ask the LLM to produce a complete SD tag prompt ───────────────────
+          // The LLM receives character description as INPUT to translate into tags,
+          // plus the current scene to extract action/pose/environment tags from.
+          const { characters, activeCharacterId, nativeSdQualityTags, nativeSdNsfw } = get();
+          const activeChar = activeCharacterId
+            ? characters.find((c) => c.id === activeCharacterId) ?? null
+            : null;
+
+          // ── Fixed prefix assembled in code (always present in the final prompt) ──
+          const prefixParts: string[] = [];
+          if (nativeSdQualityTags) prefixParts.push("score_9, score_8_up, score_7_up, masterpiece, best quality");
+          if (nativeSdNsfw)        prefixParts.push("explicit, nsfw");
+          else                     prefixParts.push("sfw");
+          if (activeChar)          prefixParts.push(`${activeChar.name}, 1girl, solo`);
+          else                     prefixParts.push("1girl, solo");
+          const fixedPrefix = prefixParts.join(", ");
+
+          // ── Context blocks passed to LLM ──
+          const charDescBlock = activeChar ? [
+            `--- CHARACTER DESCRIPTION (translate ALL visual details into SHORT appearance tags) ---`,
+            `Name: ${activeChar.name}`,
+            activeChar.description && `Description: ${activeChar.description.slice(0, 700)}`,
+            activeChar.personality && `Personality: ${activeChar.personality.slice(0, 200)}`,
+          ].filter(Boolean).join("\n") : "";
+
+          // Take the last 8 messages (4 exchanges) for scene context — enough to capture
+          // recent events, current action, location and emotional tone.
+          const recentMsgs = messages.slice(-8);
+          const chatLines = recentMsgs.map((m) => {
+            const role = m.role === "user" ? "User" : "AI";
+            // Strip only ** markers (not the content inside them — that's often the action text)
+            return `${role}: ${m.text.replace(/\*\*/g, "").replace(/\n+/g, " ").trim().slice(0, 500)}`;
+          });
+
+          const sceneBlock = [
+            `--- RECENT CHAT EVENTS (extract pose, action, clothing, facial expression, emotion, environment, lighting, camera angle${nativeSdNsfw ? ", sexual acts, body parts involved" : ""}) ---`,
+            ...chatLines,
+          ].join("\n");
+
+          // ── LLM is ONLY responsible for appearance + scene tags (not quality, not subject) ──
+          const nsfwInstruction = nativeSdNsfw
+            ? `- NSFW mode ON: you MUST include explicit sexual act tags (e.g. fellatio, on knees, penis in mouth, eye contact) when the scene contains sexual content. Do NOT censor or omit them.\n`
+            : `- SFW mode: do not include explicit sexual tags.\n`;
+
+          const promptRequest =
+            `You are a Stable Diffusion prompt engineer.\n` +
+            `Your ONLY job: output a single line of comma-separated SD tags consisting of TWO groups:\n` +
+            `GROUP A — appearance tags: translate the CHARACTER DESCRIPTION below into SHORT visual tags ` +
+              `(hair color, hair length, eye color, body type, skin tone, notable features, accessories).\n` +
+            `GROUP B — scene tags: based on the RECENT CHAT EVENTS below, extract the current pose, action, ` +
+              `clothing worn, facial expression, emotion, setting/location, lighting, camera angle` +
+              (nativeSdNsfw ? ", and ALL sexual acts/body positions described in the scene" : "") + `. ` +
+              `Use what is happening RIGHT NOW in the most recent messages.\n\n` +
+            `RULES:\n` +
+            `- Output ONLY the tags. No sentences. No explanations. No headers. No brackets.\n` +
+            `- Do NOT output quality tags. Do NOT output subject/character name tags.\n` +
+            nsfwInstruction +
+            `- Output Group A first, then Group B, all on one line separated by commas.\n\n` +
+            (charDescBlock ? charDescBlock + "\n\n" : "") +
+            sceneBlock + "\n\n" +
+            `Example output: long pink hair, small red horns, light blue eyes, curvy figure, red eyeliner, ` +
+            (nativeSdNsfw
+              ? `naked, on knees, fellatio, penis in mouth, looking up, teary eyes, indoors, dim lighting, close-up`
+              : `pilot suit, sitting in cockpit, leaning forward, smirking, warm orange lighting, upper body shot`);
+
+          const imgPromptCommand =
+            provider === "openai"     ? "analyze_with_openai"     :
+            provider === "claude"     ? "analyze_with_claude"     :
+            provider === "deepseek"   ? "analyze_with_deepseek"   :
+            provider === "local"      ? "analyze_with_local"      :
+                                        "analyze_with_openrouter";
+
+          const imgPromptPayload = provider === "local"
+            ? { base_url: localUrl, api_key: apiKey || null, prompt: promptRequest,
+                system_prompt: null, image_base64: null, context_files: null, model, max_tokens: 400 }
+            : { api_key: apiKey, prompt: promptRequest,
+                system_prompt: null, image_base64: null, context_files: null, model, max_tokens: 400 };
+
+          const result = await invoke<{ text: string }>(imgPromptCommand, { req: imgPromptPayload });
+          // Strip any accidental leading non-tag text (e.g. "Here are the tags: ")
+          const llmTags = result.text.trim().replace(/^[^a-zA-Z0-9]+/, "").replace(/,\s*,/g, ",");
+          // Prepend the code-guaranteed prefix (quality, NSFW, character name) — always present
+          visualPrompt = fixedPrefix + ", " + llmTags;
+          } // end else (custom prompt was empty)
+
+          // ── Step 2: generate the image ────────────────────────────────
+          let imageBase64: string;
+          let revisedPrompt: string | undefined;
+          let imageFormat = "png";
+
+          if (imageGenProvider === "native_sd") {
+            // Route to the local stable-diffusion.cpp binary
+            const {
+              nativeSdModelPath, nativeSdSteps, nativeSdCfg,
+              nativeSdNegPrompt, nativeSdSampler, nativeSdSeed,
+              nativeSdGpuBackend, nativeSdThreads,
+              nativeSdVaeOnCpu, nativeSdVaeTiling, nativeSdOffloadToCpu,
+              imageGenWidth: w, imageGenHeight: h,
+            } = get();
+            if (!nativeSdModelPath) throw new Error("Native SD: no model selected. Go to Settings → Image Generation → Native SD.");
+
+            console.group("%c[SD] run_local_sd request", "color:#34d399;font-weight:bold");
+            console.log("provider  :", "native_sd (stable-diffusion.cpp)");
+            console.log("gpu       :", nativeSdGpuBackend);
+            console.log("model     :", nativeSdModelPath);
+            console.log("size      :", `${w}×${h}`);
+            console.log("steps     :", nativeSdSteps, "  cfg:", nativeSdCfg, "  seed:", nativeSdSeed);
+            console.log("sampler   :", nativeSdSampler);
+            console.log("prompt    :", visualPrompt.slice(0, 200));
+            console.log("neg_prompt:", nativeSdNegPrompt || "(none)");
+            console.groupEnd();
+
+            // Subscribe to step-by-step progress events from sd binary
+            const unlistenSdProg = await listen<{ line: string }>("sd-progress", (ev) => {
+              const line = ev.payload.line;
+              const m = line.match(/(\d+)\s*\/\s*(\d+)/);
+              set({
+                sdGenProgress: {
+                  line,
+                  step:  m ? parseInt(m[1]) : 0,
+                  total: m ? parseInt(m[2]) : 0,
+                },
+              });
+            });
+
+            const sdStart = Date.now();
+            try {
+              imageBase64 = await invoke<string>("run_local_sd", {
+                req: {
+                  model_path:      nativeSdModelPath,
+                  prompt:          visualPrompt,
+                  negative_prompt: nativeSdNegPrompt || null,
+                  width:           w,
+                  height:          h,
+                  steps:           nativeSdSteps,
+                  cfg_scale:       nativeSdCfg,
+                  seed:            nativeSdSeed,
+                  sampler:         nativeSdSampler,
+                  vae_path:        null,
+                  threads:         nativeSdThreads,
+                  extra_args:      null,
+                  gpu_backend:     nativeSdGpuBackend,
+                  vae_on_cpu:      nativeSdVaeOnCpu,
+                  vae_tiling:      nativeSdVaeTiling,
+                  offload_to_cpu:  nativeSdOffloadToCpu,
+                },
+              });
+              console.log(`%c[SD] ✓ generation complete (${((Date.now()-sdStart)/1000).toFixed(1)}s)`,
+                "color:#34d399;font-weight:bold");
+            } catch (sdErr) {
+              console.error("[SD] generation failed:", sdErr);
+              throw sdErr;
+            } finally {
+              unlistenSdProg();
+              set({ sdGenProgress: null });
+            }
+          } else {
+            // Cloud / local WebUI providers
+            const resolvedKey = imageGenApiKey ||
+              ((imageGenProvider === "dalle" || imageGenProvider === "openrouter") && provider === imageGenProvider
+                ? apiKey : "");
+
+            console.group("%c[IMG] generate_image request", "color:#60a5fa;font-weight:bold");
+            console.log("provider:", imageGenProvider);
+            console.log("model   :", imageGenModel || "(default)");
+            console.log("url     :", imageGenUrl || "(default)");
+            console.log("size    :", `${imageGenWidth}×${imageGenHeight}`);
+            console.log("api_key :", resolvedKey ? `${resolvedKey.slice(0,8)}…` : "(none)");
+            console.log("prompt  :", visualPrompt.slice(0, 200));
+            console.groupEnd();
+
+            const cloudStart = Date.now();
+            const result = await invoke<{ image_base64: string; revised_prompt?: string; format: string }>(
+              "generate_image",
+              {
+                req: {
+                  prompt:    visualPrompt,
+                  provider:  imageGenProvider,
+                  api_key:   resolvedKey || null,
+                  model:     imageGenModel || null,
+                  url:       imageGenUrl || null,
+                  width:     imageGenWidth,
+                  height:    imageGenHeight,
+                },
+              }
+            );
+            console.log(`%c[IMG] ✓ received (${((Date.now()-cloudStart)/1000).toFixed(1)}s) format=${result.format}`,
+              "color:#60a5fa;font-weight:bold");
+            imageBase64    = result.image_base64;
+            revisedPrompt  = result.revised_prompt;
+            imageFormat    = result.format;
+          }
+
+          const newImage: GeneratedImage = {
+            base64:        imageBase64,
+            format:        imageFormat,
+            prompt:        visualPrompt,
+            revisedPrompt: revisedPrompt,
+            timestamp:     Date.now(),
+          };
+          set((s) => ({
+            lastGeneratedImage: newImage,
+            imageGallery: [newImage, ...s.imageGallery].slice(0, 50),
+          }));
+        } catch (err) {
+          const errMsg: ChatMessage = {
+            id: crypto.randomUUID(), role: "assistant", timestamp: Date.now(),
+            text: `**Image generation failed:** ${String(err)}`,
+          };
+          set((s) => ({ messages: [...s.messages, errMsg] }));
+        } finally {
+          set({ isGeneratingImage: false });
+        }
+      },
+
       // ── Window mode ────────────────────────────────────────────────
       windowMode: "overlay",
       setWindowMode: (mode) => {
@@ -455,7 +840,11 @@ export const useAssistantStore = create<AssistantState>()(
       messages:  [],
       prompt:    "",
       setPrompt: (p) => set({ prompt: p }),
-      isLoading: false,
+      isLoading:    false,
+      isStreaming:  false,
+      streamingText: "",
+      useStreaming:  true,
+      setUseStreaming: (v) => set({ useStreaming: v }),
 
       sendMessage: async () => {
         const { apiKey, provider, model, localUrl, prompt, capturedImage, indexedFiles, indexedRoot, messages,
@@ -582,48 +971,125 @@ export const useAssistantStore = create<AssistantState>()(
 
           const finalPrompt = fullPrompt;
 
-          const command =
-            provider === "openai"   ? "analyze_with_openai"   :
-            provider === "claude"   ? "analyze_with_claude"   :
-            provider === "deepseek" ? "analyze_with_deepseek" :
-            provider === "local"    ? "analyze_with_local"    :
-                                     "analyze_with_openrouter";
+          // ── Shared request payload ────────────────────────────────
+          const streamPayload = {
+            provider,
+            api_key:       apiKey || null,
+            prompt:        finalPrompt,
+            system_prompt: charSystemPrompt,
+            image_base64:  capturedImage ?? null,
+            context_files: contextFiles.length ? contextFiles : null,
+            model,
+            max_tokens:    maxTokens ?? null,
+            local_url:     localUrl || null,
+          };
 
-          const reqPayload = provider === "local"
-            ? {
-                base_url:      localUrl,
-                api_key:       apiKey || null,
-                prompt:        finalPrompt,
-                system_prompt: charSystemPrompt,
-                image_base64:  capturedImage ?? null,
-                context_files: contextFiles.length ? contextFiles : null,
-                model,
-                max_tokens:    maxTokens ?? null,
-              }
-            : {
-                api_key:       apiKey,
-                prompt:        finalPrompt,
-                system_prompt: charSystemPrompt,
-                image_base64:  capturedImage ?? null,
-                context_files: contextFiles.length ? contextFiles : null,
-                model,
-                max_tokens:    maxTokens ?? null,
+          // Decide whether to stream or use the old one-shot commands
+          const { useStreaming } = get();
+
+          if (useStreaming) {
+            // ── Streaming path via SSE ──────────────────────────────
+            set({ isStreaming: true, streamingText: "" });
+
+            let unlistenToken: (() => void) | null = null;
+            let unlistenDone:  (() => void) | null = null;
+
+            try {
+              const cleanup = () => {
+                const t = unlistenToken; const d = unlistenDone;
+                unlistenToken = null; unlistenDone = null;
+                t && (t as () => void)();
+                d && (d as () => void)();
               };
 
-          const result = await Promise.race([
-            invoke<{ text: string; model: string; tokens_used?: number }>(command, {
-              req: reqPayload,
-            }),
-            masterCancel,
-          ]);
+              // Promise that resolves when the stream is finished
+              const streamDone = new Promise<string>((resolve, reject) => {
+                // Register listeners first, then invoke
+                Promise.all([
+                  listen<string>("ai-stream-token", (event) => {
+                    set((s) => ({ streamingText: s.streamingText + event.payload }));
+                  }),
+                  listen<{ text?: string; model?: string; cancelled?: boolean }>("ai-stream-done", (event) => {
+                    if (event.payload.cancelled) {
+                      reject(new Error("__CANCELLED__"));
+                    } else {
+                      resolve(event.payload.text ?? get().streamingText);
+                    }
+                  }),
+                ]).then(([ulToken, ulDone]) => {
+                  unlistenToken = ulToken;
+                  unlistenDone  = ulDone;
+                  // Now invoke after listeners are registered
+                  invoke("analyze_stream", { req: streamPayload }).catch(reject);
+                }).catch(reject);
+              });
 
-          const assistantMsg: ChatMessage = {
-            id:        crypto.randomUUID(),
-            role:      "assistant",
-            text:      trimToSentenceBoundary(result.text, maxTokens),
-            timestamp: Date.now(),
-          };
-          set((s) => ({ messages: [...s.messages, assistantMsg], capturedImage: null }));
+              const finalText = await Promise.race([streamDone, masterCancel]);
+              cleanup();
+
+              const assistantMsg: ChatMessage = {
+                id:        crypto.randomUUID(),
+                role:      "assistant",
+                text:      trimToSentenceBoundary(finalText, maxTokens),
+                timestamp: Date.now(),
+              };
+              set((s) => ({
+                messages:     [...s.messages, assistantMsg],
+                capturedImage: null,
+                isStreaming:  false,
+                streamingText: "",
+              }));
+            } catch (err) {
+              const t = unlistenToken; const d = unlistenDone;
+              // TypeScript narrowing guard for captured mutable references
+              t && (t as () => void)();
+              d && (d as () => void)();
+              set({ isStreaming: false, streamingText: "" });
+              throw err; // re-throw so outer catch handles it
+            }
+          } else {
+            // ── Non-streaming (legacy) path ─────────────────────────
+            const command =
+              provider === "openai"   ? "analyze_with_openai"   :
+              provider === "claude"   ? "analyze_with_claude"   :
+              provider === "deepseek" ? "analyze_with_deepseek" :
+              provider === "local"    ? "analyze_with_local"    :
+                                       "analyze_with_openrouter";
+
+            const reqPayload = provider === "local"
+              ? {
+                  base_url:      localUrl,
+                  api_key:       apiKey || null,
+                  prompt:        finalPrompt,
+                  system_prompt: charSystemPrompt,
+                  image_base64:  capturedImage ?? null,
+                  context_files: contextFiles.length ? contextFiles : null,
+                  model,
+                  max_tokens:    maxTokens ?? null,
+                }
+              : {
+                  api_key:       apiKey,
+                  prompt:        finalPrompt,
+                  system_prompt: charSystemPrompt,
+                  image_base64:  capturedImage ?? null,
+                  context_files: contextFiles.length ? contextFiles : null,
+                  model,
+                  max_tokens:    maxTokens ?? null,
+                };
+
+            const result = await Promise.race([
+              invoke<{ text: string; model: string; tokens_used?: number }>(command, { req: reqPayload }),
+              masterCancel,
+            ]);
+
+            const assistantMsg: ChatMessage = {
+              id:        crypto.randomUUID(),
+              role:      "assistant",
+              text:      trimToSentenceBoundary(result.text, maxTokens),
+              timestamp: Date.now(),
+            };
+            set((s) => ({ messages: [...s.messages, assistantMsg], capturedImage: null }));
+          }
         } catch (err) {
           if (String(err).includes("__CANCELLED__")) {
             // User cancelled — no error message needed
@@ -649,7 +1115,7 @@ export const useAssistantStore = create<AssistantState>()(
         if (_cancelFn) { _cancelFn(); _cancelFn = null; }
         // Always reset loading — guards against stuck state from hot-reload /
         // previous crashed requests where the finally block never ran.
-        set({ isLoading: false });
+        set({ isLoading: false, isStreaming: false, streamingText: "" });
       },
 
       clearMessages: () => set({ messages: [], activeSessionId: null }),
@@ -888,6 +1354,25 @@ export const useAssistantStore = create<AssistantState>()(
             ...chat,
             messages: stripImages(chat.messages.slice(-50)),
           })),
+          // Image generation settings
+          imageGenProvider:  s.imageGenProvider,
+          imageGenApiKey:    s.imageGenApiKey,
+          imageGenModel:     s.imageGenModel,
+          imageGenUrl:       s.imageGenUrl,
+          imageGenWidth:     s.imageGenWidth,
+          imageGenHeight:    s.imageGenHeight,
+          // Native SD settings
+          nativeSdModelPath: s.nativeSdModelPath,
+          nativeSdModelsDir: s.nativeSdModelsDir,
+          nativeSdSteps:     s.nativeSdSteps,
+          nativeSdCfg:       s.nativeSdCfg,
+          nativeSdNegPrompt: s.nativeSdNegPrompt,
+          nativeSdSampler:    s.nativeSdSampler,
+          nativeSdSeed:       s.nativeSdSeed,
+          nativeSdGpuBackend: s.nativeSdGpuBackend,
+          nativeSdVaeOnCpu:     s.nativeSdVaeOnCpu,
+          nativeSdVaeTiling:    s.nativeSdVaeTiling,
+          nativeSdOffloadToCpu: s.nativeSdOffloadToCpu,
         };
       },
     }
